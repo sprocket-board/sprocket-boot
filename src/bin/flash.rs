@@ -6,7 +6,7 @@
 use core::iter::Cloned;
 use core::iter::Cycle;
 
-use sprocket_bringup as _; // global logger + panicking-behavior + memory layout
+use sprocket_boot as _; // global logger + panicking-behavior + memory layout
 use smart_leds::RGB;
 use stm32g0xx_hal::{
     stm32::{self, DWT, SPI2, TIM1},
@@ -95,7 +95,7 @@ fn main() -> ! {
         ulf
     } else {
         defmt::error!("Unlock failed!");
-        sprocket_bringup::exit()
+        sprocket_boot::exit()
     };
 
     extern "C" {
@@ -130,7 +130,7 @@ fn main() -> ! {
             FlashError::Failure => defmt::info!("failure"),
         }
 
-        sprocket_bringup::exit()
+        sprocket_boot::exit()
     }
     defmt::info!("Erase completed.");
 
@@ -138,7 +138,7 @@ fn main() -> ! {
 
     if let Err(e) = flash.write(store_start, &buffer) {
         defmt::error!("Write failed!");
-        sprocket_bringup::exit()
+        sprocket_boot::exit()
     }
     defmt::info!("Write completed.");
 
@@ -150,7 +150,7 @@ fn main() -> ! {
         defmt::info!("chunk {:?}: {:?}", i, ch);
     }
 
-    sprocket_bringup::exit()
+    sprocket_boot::exit()
 }
 
 #[inline(always)]

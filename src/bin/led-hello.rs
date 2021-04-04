@@ -5,7 +5,7 @@ use core::iter::Cloned;
 use core::iter::Cycle;
 // use rand_core::RngCore;
 
-use sprocket_bringup as _; // global logger + panicking-behavior + memory layout
+use sprocket_boot as _; // global logger + panicking-behavior + memory layout
 use smart_leds::RGB;
 use stm32g0xx_hal::{
     stm32::{self, DWT, SPI2, TIM1},
@@ -65,10 +65,12 @@ fn main() -> ! {
     let _gpio3 = gpioa.pa6;
     let _gpio4 = gpioa.pa7;
     let _gpio7 = gpioa.pa8;
-    let _i2c2_scl = gpioa.pa9; // note: shadows pa11
-    let _i2c2_sda = gpioa.pa10; // note: shadows pa12
-    let _ = gpioa.pa11; // see above
-    let _ = gpioa.pa12; // see above
+    // let i2c2_scl = gpioa.pa9; // note: shadows pa11
+    // let i2c2_sda = gpioa.pa10; // note: shadows pa12
+    let i2c2_scl = gpioa.pa11; // note: shadows pa11
+    let i2c2_sda = gpioa.pa12; // note: shadows pa12
+    // let _ = gpioa.pa11; // see above
+    // let _ = gpioa.pa12; // see above
     let _swdio = gpioa.pa13;
     let _swclk = gpioa.pa14; // also boot0
     let _spi_csn = gpioa.pa15;
@@ -86,6 +88,9 @@ fn main() -> ! {
     let _gpio8 = gpioc.pc6;
     let button1 = gpioc.pc14.into_floating_input();
     let button2 = gpioc.pc15.into_floating_input();
+
+    let button1 = i2c2_scl.into_floating_input();
+    let button2 = i2c2_sda.into_floating_input();
     // Other pins not on this chip: PC0-5, PC7-13
 
     // No gpiod or gpioe
@@ -163,10 +168,12 @@ fn main() -> ! {
 
         if !b1_now && last_b1 {
             if is_pwm_on {
+                defmt::info!("disable!");
                 led1.disable();
                 led2.disable();
                 duty = 0;
             } else {
+                defmt::info!("enable!");
                 led1.set_duty(duty as u32);
                 led2.set_duty(duty);
                 led1.enable();
@@ -184,6 +191,7 @@ fn main() -> ! {
 
             // LED1, not so useful above 4096?
             // LED1, not so useful above 16384?
+            // When not shifting, both basically cut out at 15872
         }
 
         last_b1 = b1_now;

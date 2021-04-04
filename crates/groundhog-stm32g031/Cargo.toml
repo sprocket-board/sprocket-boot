@@ -1,0 +1,27 @@
+[package]
+name = "groundhog-stm32g031"
+version = "0.3.0"
+description = "A rolling timer abstraction for the stm32g031"
+# repository = "https://github.com/jamesmunns/anachro"
+authors = ["James Munns <james.munns@ferrous-systems.com>"]
+edition = "2018"
+
+categories = [
+    "embedded",
+    "no-std",
+]
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+cortex-m-rtic = "0.5.5"
+embedded-hal = "0.2.4"
+
+[dependencies.stm32g0xx-hal]
+path = "../../vendor/stm32g0xx-hal"
+features = ["stm32g031"]
+
+[dependencies.groundhog]
+version = "0.1"
+# path = "../groundhog"
+
+[features]
