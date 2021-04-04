@@ -1,3 +1,20 @@
+// Note to self:
+//
+// A big part of this code is talking about READs and WRITEs. These are all from
+// the perspective of the Controller, not us, the Peripheral.
+//
+// So:
+//   * When you see READ, this means we are TRANSMITTING.
+//   * When you see WRITE, this means we are RECEIVING.
+//
+// It's backwards. I know. I'm open to better naming schemes.
+//
+// TODO(AJM): Move this comment if/when I move the state machine code somewhere
+// else, like a dedicated crate.
+
+// TODO(AJM): I need some kind of callback interface for doing some reaction
+// when a register read or write is complete.
+
 #![no_main]
 #![no_std]
 
@@ -228,12 +245,18 @@ fn every_n_ms(time: u32, interval: u32) -> bool {
     }
 }
 
+type WriteCompletion = fn(&mut BootMachine, usize);
+type ReadCompletion = fn(&mut BootMachine);
+
 struct BootMachine {
     i2c: I2CPeripheral,
     timer: GlobalRollingTimer,
     transfer: Transfer,
     state: State,
     buffer: [u8; 512],
+    waiting_for_stop: bool,
+    on_read: Option<ReadCompletion>,
+    on_write: Option<WriteCompletion>,
 }
 
 enum State {
@@ -280,10 +303,21 @@ impl BootMachine {
             timer: GlobalRollingTimer::new(),
             transfer: Transfer::Idle,
             state: State::Idle,
+            waiting_for_stop: false,
+            on_read: None,
+            on_write: None,
         }
     }
 
     fn poll(&mut self) -> Result<(), ()> {
+        if self.waiting_for_stop {
+            if self.process_stop() {
+                self.waiting_for_stop = false;
+            } else {
+                return Ok(());
+            }
+        }
+
         let mut old_state = Transfer::Invalid;
         core::mem::swap(&mut self.transfer, &mut old_state);
 
@@ -322,7 +356,7 @@ impl BootMachine {
                 }
             }
             Transfer::Writing { addr, len, idx } => {
-                todo!()
+                self.process_write(addr, len, idx)
             }
             Transfer::Reading { addr, len, idx } => {
                 self.process_read(addr, len, idx)
@@ -333,6 +367,71 @@ impl BootMachine {
         Ok(())
     }
 
+    fn dummy_read(&mut self) {
+        defmt::info!("Dummy read!");
+    }
+
+    fn dummy_write(&mut self, len: usize) {
+        let good_buf = &self.buffer[..len];
+        defmt::info!("Dummy write of {:?} bytes!", len);
+    }
+
+    // TODO: not bool
+    fn process_stop(&mut self) -> bool {
+        let i2cpac = self.i2c.borrow_pac();
+        self.nak();
+
+        if i2cpac.isr.read().txis().bit_is_set() {
+            defmt::error!("asked for more read when stop expected!");
+            i2cpac.txdr.modify(|_, w| {
+                unsafe {
+                    w.txdata().bits(0)
+                }
+            });
+            // return false;
+        }
+
+        // TODO: Check write
+        if i2cpac.isr.read().stopf().bit_is_set() {
+            i2cpac.icr.write(|w| {
+                w.stopcf().set_bit()
+            });
+            defmt::info!("got stop.");
+            true
+        } else {
+            false
+        }
+    }
+
+    fn process_write(&mut self, addr: u8, len: usize, mut idx: usize) -> Transfer {
+        if idx >= len {
+            panic!("Why are you writing more")
+        }
+
+        let i2cpac = self.i2c.borrow_pac();
+
+        if i2cpac.isr.read().rxne().bit_is_clear() {
+            return Transfer::Writing { addr, len, idx };
+        }
+
+        self.buffer[idx] = i2cpac.rxdr.read().rxdata().bits();
+        idx += 1;
+
+        defmt::info!("Wrote byte {:?}/{:?}", idx, len);
+
+        if idx >= len {
+            defmt::info!("Done! Waiting for stop");
+            self.waiting_for_stop = true;
+            self.nak();
+            if let Some(cb) = self.on_write.take() {
+                cb(self, len);
+            }
+            Transfer::Idle
+        } else {
+            Transfer::Writing { addr, len, idx }
+        }
+    }
+
     fn process_read(&mut self, addr: u8, len: usize, mut idx: usize) -> Transfer {
         let i2cpac = self.i2c.borrow_pac();
 
@@ -340,25 +439,31 @@ impl BootMachine {
             return Transfer::Reading { addr, len, idx };
         }
 
-        if idx < len {
-            i2cpac.txdr.modify(|_, w| {
-                unsafe {
-                    w.txdata().bits(self.buffer[idx])
-                }
-            });
-            idx += 1;
-
-            if idx == len {
-                Transfer::Idle
-            } else {
-                Transfer::Reading { addr, len, idx }
-            }
-        } else {
-            defmt::error!("Read Overrun!");
-            self.nak();
-            Transfer::Idle
+        if idx >= len {
+            panic!("Bounds checking failure")
         }
 
+        i2cpac.txdr.modify(|_, w| {
+            unsafe {
+                w.txdata().bits(self.buffer[idx])
+            }
+        });
+        idx += 1;
+        defmt::info!("Wrote byte to be read idx: {:?}/{:?}", idx, len);
+
+        if idx == len {
+            defmt::info!("Done! Waiting for stop");
+            self.nak();
+            self.waiting_for_stop = true;
+
+            if let Some(cb) = self.on_read.take() {
+                cb(self);
+            }
+
+            Transfer::Idle
+        } else {
+            Transfer::Reading { addr, len, idx }
+        }
     }
 
     fn start_txfr(&mut self, addr: u8) -> Option<Transfer> {
@@ -369,6 +474,7 @@ impl BootMachine {
             //         * 1 byte - total subpages to write
             //             * NOTE: must be less than 23 * 8 for now
             0x40 => {
+                self.on_write = Some(Self::dummy_write);
                 Some(Transfer::Writing {
                     addr,
                     len: 5,
@@ -400,7 +506,17 @@ impl BootMachine {
             //     * wr-then-rd 0x10 + 16 bytes => b'sprocket boot!!!'
             0x10 => {
                 const ID: &[u8] = b"sprocket boot!!!";
+                defmt::info!("Got 0x10 write, going to read");
                 (&mut self.buffer[..ID.len()]).copy_from_slice(ID);
+                self.waiting_for_stop = true;
+                self.on_read = Some(Self::dummy_read);
+                // let i2cpac = self.i2c.borrow_pac();
+                // i2cpac.cr2.modify(|_, w| unsafe {
+                //     // TODO(AJM): handle writes longer than 255
+                //     w.nbytes().bits(ID.len() as u8)
+                //     .reload().clear_bit()
+                // });
+
                 Some(Transfer::WaitReadStart {
                     addr,
                     len: ID.len(),
@@ -437,6 +553,7 @@ impl BootMachine {
             TransferDir::Write
         };
 
+
         // Is this in the direction we expected?
         if dir != direction {
             self.nak();
@@ -445,6 +562,11 @@ impl BootMachine {
             false
         } else {
             defmt::info!("Acked a correct address+direction");
+            if direction == TransferDir::Read {
+                i2cpac.isr.write(|w| {
+                    w.txe().set_bit()
+                });
+            }
             self.ack_addr_match();
             true
         }
