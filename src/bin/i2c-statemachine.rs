@@ -190,13 +190,10 @@ struct BootMachine {
     timer: GlobalRollingTimer,
     transfer: Transfer,
     state: BootLoadState,
-    action: Option<BootLoadAction>,
     buffer: [u8; 512],
-    waiting_for_stop: bool,
-    on_read: Option<ReadCompletion>,
-    on_write: Option<WriteCompletion>,
     flash: UnlockedFlash,
     map: PageMap,
+    sq: StateQueue,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -223,13 +220,7 @@ enum BootLoadState {
 
 enum Transfer {
     Idle,
-    WriteWaitReg,
     Writing {
-        addr: u8,
-        len: usize,
-        idx: usize,
-    },
-    WaitReadStart {
         addr: u8,
         len: usize,
         idx: usize,
@@ -248,6 +239,96 @@ enum TransferDir {
     Write,
 }
 
+type QueueFunc<T> = fn(&mut BootMachine) -> Result<T, ()>;
+
+#[derive(Clone)]
+struct StateQueueItem(QueueFunc<bool>);
+
+impl Default for StateQueueItem {
+    fn default() -> Self {
+        Self(nop_state_err)
+    }
+}
+
+fn nop_state_err<T>(_: &mut BootMachine) -> Result<T, ()> {
+    defmt::error!("Nop state error!");
+    Err(())
+}
+
+fn nop_state_ok(_: &mut BootMachine) -> Result<(), ()> {
+    Ok(())
+}
+
+fn nop_state_true(_: &mut BootMachine) -> Result<bool, ()> {
+    Ok(true)
+}
+
+const ITEMS: usize = 8;
+
+struct StateQueue {
+    items: [StateQueueItem; ITEMS],
+    idx: usize,
+}
+
+impl StateQueue {
+    fn new() -> Self {
+        Self {
+            idx: 0,
+            items: [
+                StateQueueItem::default(),
+                StateQueueItem::default(),
+                StateQueueItem::default(),
+                StateQueueItem::default(),
+                StateQueueItem::default(),
+                StateQueueItem::default(),
+                StateQueueItem::default(),
+                StateQueueItem::default(),
+            ]
+        }
+    }
+
+    fn from_slice(items: &[StateQueueItem]) -> Self {
+        let mut new = Self::new();
+        new.idx = 0;
+        items.iter().rev().take(ITEMS).for_each(|i| {
+            new.items[new.idx] = i.clone();
+            new.idx += 1;
+        });
+        new
+    }
+
+    fn pop(&mut self) -> Option<StateQueueItem> {
+        if self.idx == 0 {
+            None
+        } else {
+            let mut replace = StateQueueItem::default();
+            core::mem::swap(&mut replace, &mut self.items[self.idx - 1]);
+            self.idx -= 1;
+            Some(replace)
+        }
+    }
+
+    fn push(&mut self, item: StateQueueItem) -> Result<(), ()> {
+        if self.idx == ITEMS {
+            defmt::error!("Push fail!");
+            return Err(());
+        }
+
+        self.items[self.idx] = item;
+        self.idx += 1;
+        Ok(())
+    }
+
+    fn len(&self) -> usize {
+        self.idx
+    }
+}
+
+static DEFAULT_SEQUENCE: &[StateQueueItem] = &[
+    StateQueueItem(BootMachine::match_address_write),
+    StateQueueItem(BootMachine::match_write_register),
+];
+
 impl BootMachine {
     fn new(i2c: I2CPeripheral, flash: UnlockedFlash) -> Self {
         Self {
@@ -257,232 +338,85 @@ impl BootMachine {
             timer: GlobalRollingTimer::new(),
             transfer: Transfer::Idle,
             state: BootLoadState::Idle,
-            waiting_for_stop: false,
-            on_read: None,
-            on_write: None,
-            action: None,
             map: PageMap { pages: [0; TOTAL_PAGES] },
+            sq: StateQueue::from_slice(DEFAULT_SEQUENCE),
         }
     }
 
-    fn poll(&mut self) -> Result<(), ()> {
-        if self.waiting_for_stop {
-            if self.process_stop() {
-                defmt::info!("Got stop!");
-                self.i2c.borrow_pac().cr2.write(|w| {
-                    w.nack().clear_bit()
-                });
-                self.waiting_for_stop = false;
-            } else {
-                return Ok(());
-            }
-        }
-
-        let mut done = false;
-
-        self.action.take().map(|a| {
-            // Disable I2C. We know we just got a stop. Maybe.
-            // NAK everything until we are done
-            unsafe {
-                self.i2c.disable();
-            }
-
-            extern "C" {
-                static _store_start: u32;
-            }
-
-            let store_start = unsafe { &_store_start as *const _ as usize };
-            // let store_page = FlashPage((store_start - flash::FLASH_START) / flash::PAGE_SIZE as usize);
-
-            let action = if let BootLoadAction::EraseThenWrite {
-                erase_page,
-                write_page,
-                write_subpage,
-            } = a {
-                if let Err(e) = self.flash.erase_page(FlashPage(PAGE_OFFSET + erase_page)) {
-                    defmt::error!("Erase failed!");
-
-                    match e {
-                        FlashError::Busy => defmt::info!("busy"),
-                        FlashError::Illegal => defmt::info!("illegal"),
-                        FlashError::EccError => defmt::info!("ecc err"),
-                        FlashError::PageOutOfRange => defmt::info!("page oor"),
-                        FlashError::Failure => defmt::info!("failure"),
-                    }
-
-                    sprocket_boot::exit()
-                }
-
-                // Erase good! Move on to write
-                BootLoadAction::Writing { write_page, write_subpage }
-            } else {
-                a
-            };
-
-            if let BootLoadAction::Writing {
-                write_page,
-                write_subpage,
-            } = action {
-                // NOTE: store_start is already offset to the base of the temporary flash region
-                let store_addr = (store_start + (write_page * flash::PAGE_SIZE as usize))
-                    + (write_subpage as usize * 256);
-                if let Err(e) = self.flash.write(store_addr, &self.buffer[1..257]) {
-                    defmt::error!("Write failed!");
-                    sprocket_boot::exit()
-                }
-            } else {
-                defmt::error!("What?!?!");
-            };
-
-            unsafe {
-                self.i2c.enable();
-            }
-        });
-
-        if done {
-            return Ok(());
-        }
-
-        if !self.i2c.is_enabled() {
-            defmt::error!("Oops, expected to be enabled but we're not");
-            return Err(());
-        }
-
-        // HERE, I need to see if an action is pending, and start acting on it.
-
-        let mut old_state = Transfer::Invalid;
-        core::mem::swap(&mut self.transfer, &mut old_state);
-
-        // Check state of active transfer
-        self.transfer = match old_state {
-            Transfer::Idle => {
-                // We always expect a write from idle (write or write-then-read)
-                if self.check_addr_match(TransferDir::Write) {
-                    Transfer::WriteWaitReg
-                } else {
-                    Transfer::Idle
-                }
-            }
-            Transfer::WriteWaitReg => {
-                if let Some(data) = self.get_written_byte() {
-                    if let Some(txfr) = self.start_txfr(data) {
-                        txfr
-                    } else {
-                        defmt::error!("Bad txfr");
-                        self.nak();
-                        Transfer::Idle
-                    }
-                } else {
-                    Transfer::WriteWaitReg
-                }
-            }
-            Transfer::WaitReadStart { addr, len, idx } => {
-                // TODO: I probably shouldn't NAK here, but if I got an unexpected
-                // write command, I should just abort the expected read and move on
-                //
-                // check_addr_match probably needs some better ability to state whether
-                // we are waiting, something bad happened, etc.
-                if self.check_addr_match(TransferDir::Read) {
-                    Transfer::Reading { addr, len, idx }
-                } else {
-                    Transfer::WaitReadStart { addr, len, idx }
-                }
-            }
-            Transfer::Writing { addr, len, idx } => {
-                self.process_write(addr, len, idx)
-            }
-            Transfer::Reading { addr, len, idx } => {
-                self.process_read(addr, len, idx)
-            }
-            _ => todo!()
-        };
-
-        Ok(())
-    }
-
-    fn write_page(&mut self, len: usize) {
-        if len != (1 + 256 + 4) {
-            defmt::error!("Wrong number of bytes!");
-            return;
-        }
-        //         * 1: Page/Subpage
-        //             * 0bPPPPP_SSS (32 pages, 8 sub-pages)
-        //             * 0bPPPPP must be <= 23
-        //         * 256: subpage contents
-        //         * 4 byte: For now: 32-bit checksum. Later, CRC32 or Poly1305?
-        let ps = self.buffer[0];
-
-        let page = (ps >> 3) as usize;
-        let subpage = ps & 0b111;
-
-        assert!(page < TOTAL_PAGES);
-        assert!((subpage as usize) < SUBPAGES_PER_PAGE);
-
-        todo!("check checksum!");
-
-        let map = &mut self.map.pages[page];
-
-        if *map == 0 {
-            *map = *map | (1 << subpage);
-            // All subpages have never been written, time to flash
-            self.action = Some(BootLoadAction::EraseThenWrite {
-                erase_page: page,
-                write_page: page,
-                write_subpage: subpage,
-            })
-        } else if (*map & 1 << subpage) == 0 {
-            *map = *map | (1 << subpage);
-            self.action = Some(BootLoadAction::Writing {
-                write_page: page,
-                write_subpage: subpage,
-            });
+    fn complete_write(&mut self) -> Result<bool, ()> {
+        let (addr, mut idx, len) = if let Transfer::Writing { addr, len, idx } = &self.transfer {
+            (*addr, *idx, *len)
         } else {
-            defmt::error!("Can't re-write pages!");
-        }
-
-        //
-    }
-
-    fn activate_bootload(&mut self, len: usize) {
-        if len != 5 {
-            defmt::error!("Wrong number of bytes!");
-            return;
-        }
-
-        let mut checksum_bytes = [0u8; 4];
-        checksum_bytes.copy_from_slice(&self.buffer[..4]);
-
-        let checksum = u32::from_le_bytes(checksum_bytes);
-        let subpages = self.buffer[4];
-
-        if subpages as usize > TOTAL_SUBPAGES {
-            defmt::error!("Too many subpages!");
-            return;
-        }
-
-        // TODO: check we are idle
-        self.state = BootLoadState::BootloadEnabled {
-            ttl_subpages: subpages as usize,
-            checksum,
+            defmt::error!("Wrong state for complete_write!");
+            return Err(());
         };
-        self.map.pages.iter_mut().for_each(|b| {
-            *b = 0;
+
+        if idx >= len {
+            panic!("Why are you writing more")
+        }
+
+        let i2cpac = self.i2c.borrow_pac();
+
+        if i2cpac.isr.read().rxne().bit_is_clear() {
+            // Not done
+            return Ok(false);
+        }
+
+        self.buffer[idx] = i2cpac.rxdr.read().rxdata().bits();
+        idx += 1;
+
+        // Some kind of timing race... when this line is uncommented
+        // it causes the host to get a NAK??? But this line is never hit
+        //
+        // TODO: wat
+        //
+        // defmt::info!("Wrote byte {:?}/{:?}", idx, len);
+
+        if idx >= len {
+            defmt::info!("Done! Waiting for stop");
+            Ok(true)
+        } else {
+            self.transfer = Transfer::Writing { addr, len, idx };
+            Ok(false)
+        }
+    }
+
+    fn complete_read(&mut self) -> Result<bool, ()> {
+        let (addr, mut idx, len) = if let Transfer::Reading { addr, len, idx } = &self.transfer {
+            (*addr, *idx, *len)
+        } else {
+            defmt::error!("wrong state!");
+            return Err(());
+        };
+
+        let i2cpac = self.i2c.borrow_pac();
+
+        if i2cpac.isr.read().txis().bit_is_clear() {
+            // Not done
+            return Ok(false);
+        }
+
+        if idx >= len {
+            panic!("Bounds checking failure")
+        }
+
+        defmt::info!("read one");
+        i2cpac.txdr.modify(|_, w| {
+            unsafe {
+                w.txdata().bits(self.buffer[idx])
+            }
         });
+        idx += 1;
 
-        defmt::info!("Unlocked Bootloading; pages: {=u8}, checksum: 0x{=u32:X}", subpages, checksum);
+        if idx == len {
+            Ok(true)
+        } else {
+            self.transfer = Transfer::Reading { addr, len, idx };
+            Ok(false)
+        }
     }
 
-    fn dummy_read(&mut self) {
-        defmt::info!("Dummy read!");
-    }
-
-    fn dummy_write(&mut self, len: usize) {
-        let good_buf = &self.buffer[..len];
-        defmt::info!("Dummy write of {:?} bytes!", len);
-    }
-
-    // TODO: not bool
-    fn process_stop(&mut self) -> bool {
+    fn wait_for_stop(&mut self) -> Result<bool, ()> {
         let i2cpac = self.i2c.borrow_pac();
 
         let isr = i2cpac.isr.read();
@@ -511,81 +445,296 @@ impl BootMachine {
                 w.stopcf().set_bit()
             });
             defmt::info!("got stop.");
-            true
+            Ok(true)
         } else {
-            false
+            Ok(false)
         }
     }
 
-    fn process_write(&mut self, addr: u8, len: usize, mut idx: usize) -> Transfer {
-        if idx >= len {
-            panic!("Why are you writing more")
-        }
-
-        let i2cpac = self.i2c.borrow_pac();
-
-        if i2cpac.isr.read().rxne().bit_is_clear() {
-            return Transfer::Writing { addr, len, idx };
-        }
-
-        self.buffer[idx] = i2cpac.rxdr.read().rxdata().bits();
-        idx += 1;
-
-        // Some kind of data race... when this line is uncommented
-        // it causes the host to get a NAK??? But this line is never hit
-        //
-        // TODO: wat
-        //
-        // defmt::info!("Wrote byte {:?}/{:?}", idx, len);
-
-        if idx >= len {
-            defmt::info!("Done! Waiting for stop");
-            self.waiting_for_stop = true;
-            self.nak();
-            if let Some(cb) = self.on_write.take() {
-                cb(self, len);
-            }
-            Transfer::Idle
+    fn match_write_register(&mut self) -> Result<bool, ()> {
+        if let Some(data) = self.get_written_byte() {
+            self.sq = self.start_txfr(data);
+            Ok(true)
         } else {
-            Transfer::Writing { addr, len, idx }
+            Ok(false)
         }
     }
 
-    fn process_read(&mut self, addr: u8, len: usize, mut idx: usize) -> Transfer {
-        let i2cpac = self.i2c.borrow_pac();
-
-        if i2cpac.isr.read().txis().bit_is_clear() {
-            return Transfer::Reading { addr, len, idx };
+    fn match_address_read(&mut self) -> Result<bool, ()> {
+        // We always expect a write from idle (write or write-then-read)
+        if self.check_addr_match(TransferDir::Read) {
+            Ok(true)
+        } else {
+            Ok(false)
         }
+    }
 
-        if idx >= len {
-            panic!("Bounds checking failure")
+    fn match_address_write(&mut self) -> Result<bool, ()> {
+        // We always expect a write from idle (write or write-then-read)
+        if self.check_addr_match(TransferDir::Write) {
+            Ok(true)
+        } else {
+            Ok(false)
         }
+    }
 
-        i2cpac.txdr.modify(|_, w| {
-            unsafe {
-                w.txdata().bits(self.buffer[idx])
+    fn poll_inner(&mut self) -> Result<(), ()> {
+        let mut action = self.sq.pop().unwrap(); // TODO
+
+        if !(action.0)(self)? {
+            let x = self.sq.push(action);
+            if x.is_err() {
+                defmt::error!("Queue is full???");
             }
+
+            x?;
+        }
+
+        Ok(())
+    }
+
+    fn poll(&mut self) -> Result<(), ()> {
+        match self.poll_inner() {
+            Ok(()) => Ok(()),
+            Err(()) => {
+                todo!("clear the queue, go into some kind of recovery?");
+            }
+        }
+    }
+
+    // fn poll(&mut self) -> Result<(), ()> {
+    //     if self.waiting_for_stop {
+    //         if self.process_stop() {
+    //             defmt::info!("Got stop!");
+    //             self.i2c.borrow_pac().cr2.write(|w| {
+    //                 w.nack().clear_bit()
+    //             });
+    //             self.waiting_for_stop = false;
+    //         } else {
+    //             return Ok(());
+    //         }
+    //     }
+
+    //     let mut done = false;
+
+    //     self.action.take().map(|a| {
+    //         // Disable I2C. We know we just got a stop. Maybe.
+    //         // NAK everything until we are done
+    //         unsafe {
+    //             self.i2c.disable();
+    //         }
+
+    //         extern "C" {
+    //             static _store_start: u32;
+    //         }
+
+    //         let store_start = unsafe { &_store_start as *const _ as usize };
+    //         // let store_page = FlashPage((store_start - flash::FLASH_START) / flash::PAGE_SIZE as usize);
+
+    //         let action = if let BootLoadAction::EraseThenWrite {
+    //             erase_page,
+    //             write_page,
+    //             write_subpage,
+    //         } = a {
+    //             if let Err(e) = self.flash.erase_page(FlashPage(PAGE_OFFSET + erase_page)) {
+    //                 defmt::error!("Erase failed!");
+
+    //                 match e {
+    //                     FlashError::Busy => defmt::info!("busy"),
+    //                     FlashError::Illegal => defmt::info!("illegal"),
+    //                     FlashError::EccError => defmt::info!("ecc err"),
+    //                     FlashError::PageOutOfRange => defmt::info!("page oor"),
+    //                     FlashError::Failure => defmt::info!("failure"),
+    //                 }
+
+    //                 sprocket_boot::exit()
+    //             }
+
+    //             // Erase good! Move on to write
+    //             BootLoadAction::Writing { write_page, write_subpage }
+    //         } else {
+    //             a
+    //         };
+
+    //         if let BootLoadAction::Writing {
+    //             write_page,
+    //             write_subpage,
+    //         } = action {
+    //             // NOTE: store_start is already offset to the base of the temporary flash region
+    //             let store_addr = (store_start + (write_page * flash::PAGE_SIZE as usize))
+    //                 + (write_subpage as usize * 256);
+    //             if let Err(e) = self.flash.write(store_addr, &self.buffer[1..257]) {
+    //                 defmt::error!("Write failed!");
+    //                 sprocket_boot::exit()
+    //             }
+    //         } else {
+    //             defmt::error!("What?!?!");
+    //         };
+
+    //         unsafe {
+    //             self.i2c.enable();
+    //         }
+    //     });
+
+    //     if done {
+    //         return Ok(());
+    //     }
+
+    //     if !self.i2c.is_enabled() {
+    //         defmt::error!("Oops, expected to be enabled but we're not");
+    //         return Err(());
+    //     }
+
+    //     // HERE, I need to see if an action is pending, and start acting on it.
+
+    //     let mut old_state = Transfer::Invalid;
+    //     core::mem::swap(&mut self.transfer, &mut old_state);
+
+    //     // Check state of active transfer
+    //     self.transfer = match old_state {
+    //         Transfer::Idle => {
+    //             // We always expect a write from idle (write or write-then-read)
+    //             if self.check_addr_match(TransferDir::Write) {
+    //                 Transfer::WriteWaitReg
+    //             } else {
+    //                 Transfer::Idle
+    //             }
+    //         }
+    //         Transfer::WriteWaitReg => {
+    //             if let Some(data) = self.get_written_byte() {
+    //                 if let Some(txfr) = self.start_txfr(data) {
+    //                     txfr
+    //                 } else {
+    //                     defmt::error!("Bad txfr");
+    //                     self.nak();
+    //                     Transfer::Idle
+    //                 }
+    //             } else {
+    //                 Transfer::WriteWaitReg
+    //             }
+    //         }
+    //         Transfer::WaitReadStart { addr, len, idx } => {
+    //             // TODO: I probably shouldn't NAK here, but if I got an unexpected
+    //             // write command, I should just abort the expected read and move on
+    //             //
+    //             // check_addr_match probably needs some better ability to state whether
+    //             // we are waiting, something bad happened, etc.
+    //             if self.check_addr_match(TransferDir::Read) {
+    //                 Transfer::Reading { addr, len, idx }
+    //             } else {
+    //                 Transfer::WaitReadStart { addr, len, idx }
+    //             }
+    //         }
+    //         Transfer::Writing { addr, len, idx } => {
+    //             self.process_write(addr, len, idx)
+    //         }
+    //         Transfer::Reading { addr, len, idx } => {
+    //             self.process_read(addr, len, idx)
+    //         }
+    //         _ => todo!()
+    //     };
+
+    //     Ok(())
+    // }
+
+    fn write_page(&mut self) -> Result<bool, ()> {
+        let (addr, mut idx, len) = if let Transfer::Writing { addr, len, idx } = &self.transfer {
+            (*addr, *idx, *len)
+        } else {
+            defmt::error!("Wrong state for write_page!");
+            return Err(());
+        };
+
+        if len != (1 + 256 + 4) {
+            defmt::error!("Wrong number of bytes!");
+            return Err(());
+        }
+        //         * 1: Page/Subpage
+        //             * 0bPPPPP_SSS (32 pages, 8 sub-pages)
+        //             * 0bPPPPP must be <= 23
+        //         * 256: subpage contents
+        //         * 4 byte: For now: 32-bit checksum. Later, CRC32 or Poly1305?
+        let ps = self.buffer[0];
+
+        let page = (ps >> 3) as usize;
+        let subpage = ps & 0b111;
+
+        assert!(page < TOTAL_PAGES);
+        assert!((subpage as usize) < SUBPAGES_PER_PAGE);
+
+        todo!("check checksum!");
+
+        // let map = &mut self.map.pages[page];
+
+        // if *map == 0 {
+        //     *map = *map | (1 << subpage);
+        //     // All subpages have never been written, time to flash
+        //     self.action = Some(BootLoadAction::EraseThenWrite {
+        //         erase_page: page,
+        //         write_page: page,
+        //         write_subpage: subpage,
+        //     })
+        // } else if (*map & 1 << subpage) == 0 {
+        //     *map = *map | (1 << subpage);
+        //     self.action = Some(BootLoadAction::Writing {
+        //         write_page: page,
+        //         write_subpage: subpage,
+        //     });
+        // } else {
+        //     defmt::error!("Can't re-write pages!");
+        // }
+
+        //
+    }
+
+    fn activate_bootload(&mut self) -> Result<bool, ()> {
+        let len = if let Transfer::Writing { len, .. } = self.transfer {
+            len
+        } else {
+            defmt::error!("Wrong state!");
+            return Err(())
+        };
+
+        if len != 5 {
+            defmt::error!("Wrong number of bytes!");
+            return Err(());
+        }
+
+        let mut checksum_bytes = [0u8; 4];
+        checksum_bytes.copy_from_slice(&self.buffer[..4]);
+
+        let checksum = u32::from_le_bytes(checksum_bytes);
+        let subpages = self.buffer[4];
+
+        if subpages as usize > TOTAL_SUBPAGES {
+            defmt::error!("Too many subpages!");
+            return Err(());
+        }
+
+        // TODO: check we are idle
+        self.state = BootLoadState::BootloadEnabled {
+            ttl_subpages: subpages as usize,
+            checksum,
+        };
+        self.map.pages.iter_mut().for_each(|b| {
+            *b = 0;
         });
-        idx += 1;
-        defmt::info!("Wrote byte to be read idx: {:?}/{:?}", idx, len);
 
-        if idx == len {
-            defmt::info!("Done! Waiting for stop");
-            self.nak();
-            self.waiting_for_stop = true;
+        defmt::info!("Unlocked Bootloading; pages: {=u8}, checksum: 0x{=u32:X}", subpages, checksum);
 
-            if let Some(cb) = self.on_read.take() {
-                cb(self);
-            }
-
-            Transfer::Idle
-        } else {
-            Transfer::Reading { addr, len, idx }
-        }
+        Ok(true)
     }
 
-    fn start_txfr(&mut self, addr: u8) -> Option<Transfer> {
+    fn dummy_read(&mut self) {
+        defmt::info!("Dummy read!");
+    }
+
+    fn dummy_write(&mut self, len: usize) {
+        let good_buf = &self.buffer[..len];
+        defmt::info!("Dummy write of {:?} bytes!", len);
+    }
+
+    fn start_txfr(&mut self, addr: u8) -> StateQueue {
         match addr {
             // * Write transactions:
 
@@ -595,12 +744,18 @@ impl BootMachine {
             //         * NOTE: must be less than 23 * 8 for now
             0x40 => {
                 defmt::info!("Start Bootload");
-                self.on_write = Some(Self::activate_bootload);
-                Some(Transfer::Writing {
+                self.transfer = Transfer::Writing {
                     addr,
                     len: 5,
                     idx: 0,
-                })
+                };
+                StateQueue::from_slice(&[
+                    StateQueueItem(BootMachine::complete_write),
+                    StateQueueItem(BootMachine::activate_bootload),
+                    StateQueueItem(BootMachine::wait_for_stop),
+                    StateQueueItem(BootMachine::match_address_write),
+                    StateQueueItem(BootMachine::match_write_register),
+                ])
             }
 
             // * 0x41 - write page command
@@ -620,12 +775,18 @@ impl BootMachine {
             //         * 0:0 must be the last thing written
             0x41 => {
                 defmt::info!("Write Page");
-                self.on_write = Some(Self::dummy_write);
-                Some(Transfer::Writing {
+                self.transfer = Transfer::Writing {
                     addr,
                     len: 1 + 256 + 4,
                     idx: 0,
-                })
+                };
+                StateQueue::from_slice(&[
+                    StateQueueItem(BootMachine::complete_write),
+                    StateQueueItem(BootMachine::write_page),
+                    StateQueueItem(BootMachine::wait_for_stop),
+                    StateQueueItem(BootMachine::match_address_write),
+                    StateQueueItem(BootMachine::match_write_register),
+                ])
             }
 
             //     * 0x42 - reboot to new image
@@ -640,27 +801,30 @@ impl BootMachine {
             0x10 => {
                 const ID: &[u8] = b"sprocket boot!!!";
                 defmt::info!("Got 0x10 write, going to read");
-                (&mut self.buffer[..ID.len()]).copy_from_slice(ID);
-                self.waiting_for_stop = true;
-                self.on_read = Some(Self::dummy_read);
-                // let i2cpac = self.i2c.borrow_pac();
-                // i2cpac.cr2.modify(|_, w| unsafe {
-                //     // TODO(AJM): handle writes longer than 255
-                //     w.nbytes().bits(ID.len() as u8)
-                //     .reload().clear_bit()
-                // });
 
-                Some(Transfer::WaitReadStart {
+                (&mut self.buffer[..ID.len()]).copy_from_slice(ID);
+
+                self.transfer = Transfer::Reading {
                     addr,
                     len: ID.len(),
                     idx: 0,
-                })
+                };
+
+                StateQueue::from_slice(&[
+                    StateQueueItem(BootMachine::wait_for_stop),
+                    StateQueueItem(BootMachine::match_address_read),
+                    //  Nothing extra to do on complete
+                    StateQueueItem(BootMachine::complete_read),
+                    StateQueueItem(BootMachine::wait_for_stop),
+                    StateQueueItem(BootMachine::match_address_write),
+                    StateQueueItem(BootMachine::match_write_register),
+                ])
             }
             //     * wr-then-rd 0x11 + 4 bytes => maj.min.triv.reserved
             //     * wr-then-rd [0x21, P:S] + 260 bytes => Read subpage
             //     * wr-then-rd 0x22 + 1 byte => status
             //     * wr-then-rd 0x23 + 4 bytes => children flashed
-            _ => None
+            _ => todo!()
         }
     }
 
