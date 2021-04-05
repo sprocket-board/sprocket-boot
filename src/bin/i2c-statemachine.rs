@@ -28,6 +28,7 @@ use sprocket_boot as _; // global logger + panicking-behavior + memory layout
 use smart_leds::RGB;
 use stm32g0xx_hal::flash;
 use stm32g0xx_hal::flash::FlashPage;
+use stm32g0xx_hal::flash::Read;
 use stm32g0xx_hal::flash::UnlockedFlash;
 use stm32g0xx_hal::flash::WriteErase;
 use stm32g0xx_hal::flash::Error as FlashError;
@@ -75,6 +76,8 @@ struct PageMap {
     pages: [u8; TOTAL_PAGES],
     active_pages: usize,
     unlocked: bool,
+    msp: usize,
+    reset_vector: usize,
 }
 
 impl PageMap {
@@ -85,11 +88,31 @@ impl PageMap {
 
         self.pages.get_mut(page)
     }
-}
 
-// TODO: This should go away. The real device will write at the
-// beginning of flash.
-const PAGE_OFFSET: usize = 32 - TOTAL_PAGES;
+    fn ready_to_write_vector_subpage(&self) -> bool {
+        if !(self.unlocked && self.active_pages > 0) {
+            return false;
+        }
+
+        // TODO: I probably want to ensure that the vector table SUBPAGE is written first in this page, because
+        // if we lose power, we could be in trouble.
+        self.pages[0] == 0xFE &&
+            self.pages
+                .iter()
+                .skip(1)
+                .take(self.active_pages - 1)
+                .all(|p| *p == 0xFF)
+    }
+
+    fn bootload_complete(&self) -> bool {
+        self.unlocked &&
+            self.active_pages > 0 &&
+            self.pages
+                .iter()
+                .take(self.active_pages)
+                .all(|p| *p == 0xFF)
+    }
+}
 
 fn inner_main() -> Result<(), ()> {
     defmt::info!("Hello, world!");
@@ -344,7 +367,13 @@ impl BootMachine {
             buffer: [0u8; 512],
             timer: GlobalRollingTimer::new(),
             transfer: Transfer::Idle,
-            map: PageMap { pages: [0; TOTAL_PAGES], active_pages: 0, unlocked: false },
+            map: PageMap {
+                pages: [0; TOTAL_PAGES],
+                active_pages: 0,
+                unlocked: false,
+                msp: 0,
+                reset_vector: 0,
+            },
             sq: StateQueue::from_slice(DEFAULT_SEQUENCE),
             flash_action: BootLoadAction::Idle,
         }
@@ -519,11 +548,10 @@ impl BootMachine {
             return Err(())
         };
 
-        let real_page = PAGE_OFFSET + page;
-        defmt::info!("erasing page {=u32}...", real_page as u32);
+        defmt::info!("erasing page {=u32}...", page as u32);
 
         if !SKIP_FLASH {
-            if let Err(e) = self.flash.erase_page(FlashPage(real_page)) {
+            if let Err(e) = self.flash.erase_page(FlashPage(page)) {
                 defmt::error!("Erase failed:");
 
                 match e {
@@ -565,13 +593,13 @@ impl BootMachine {
         }
 
         extern "C" {
-            static _store_start: u32;
+            static _app_start: u32;
         }
 
-        let store_start = unsafe { &_store_start as *const _ as usize };
+        let app_start = unsafe { &_app_start as *const _ as usize };
 
-        // NOTE: store_start is already offset to the base of the temporary flash region
-        let store_addr = (store_start + (page * flash::PAGE_SIZE as usize))
+        // NOTE: app_start is already offset to the base of the temporary flash region
+        let store_addr = (app_start + (page * flash::PAGE_SIZE as usize))
             + (subpage as usize * 256);
 
         defmt::info!("Writing subpage at {=u32:X}...", store_addr as u32);
@@ -658,14 +686,28 @@ impl BootMachine {
                 static _stack_start: u32;
             }
 
+            if !self.map.ready_to_write_vector_subpage() {
+                defmt::error!("Must write page 0 subpage 0 last!");
+                return Err(());
+            }
+
             let reset_vector = unsafe { &Reset as *const _ as usize };
             let msp = unsafe { &_stack_start as *const _ as usize };
 
             defmt::info!("Patching reset vector to {=usize:X}", reset_vector);
             defmt::info!("Patching MSP to {=usize:X}", msp);
 
-            // TODO: Remove for production and implement these checks
-            defmt::warn!("Skipping ResetVector+MSP hotpatch and last section check!");
+            let mut reset_vector_bytes = [0u8; 4];
+            let mut msp_bytes = [0u8; 4];
+
+            msp_bytes.copy_from_slice(&self.buffer[1..5]);
+            reset_vector_bytes.copy_from_slice(&self.buffer[5..9]);
+
+            self.map.reset_vector = usize::from_le_bytes(reset_vector_bytes);
+            self.map.msp = usize::from_le_bytes(msp_bytes);
+
+            self.buffer[1..5].copy_from_slice(&msp.to_le_bytes());
+            self.buffer[5..9].copy_from_slice(&reset_vector.to_le_bytes());
         }
 
 
@@ -770,6 +812,75 @@ impl BootMachine {
         defmt::info!("Dummy write of {:?} bytes!", len);
     }
 
+    fn write_settings_page(&mut self) -> Result<bool, ()> {
+        extern "C" {
+            static _settings_start: u32;
+        }
+
+        let settings_start = unsafe { &_settings_start as *const _ as usize };
+
+        defmt::info!("Reading settings page...");
+
+        if !SKIP_FLASH {
+            self.flash.read(settings_start, &mut self.buffer[..256]);
+        } else {
+            defmt::warn!("Skipping real settings read! Loading all 0xFFs");
+            self.buffer[..256].iter_mut().for_each(|b| *b = 0xFF);
+        }
+
+        // TODO: actual serialization/deserialization of settings page
+        defmt::warn!("Manually applying new reset vector and msp to settings page");
+
+        defmt::info!("App MSP: {=usize:X}", self.map.msp);
+        defmt::info!("App RsV: {=usize:X}", self.map.reset_vector);
+
+        self.buffer[..4].copy_from_slice(&self.map.msp.to_le_bytes());
+        self.buffer[4..8].copy_from_slice(&self.map.reset_vector.to_le_bytes());
+
+        // TODO: De-duplicate this with erase page and write page. Right now it's
+        // hardcoded to the offset write section, instead of the total range.
+
+        // TODO: not magic numbers
+        let real_page = (settings_start - 0x0800_0000) / 2048;
+
+        if !SKIP_FLASH {
+            if let Err(e) = self.flash.erase_page(FlashPage(real_page)) {
+                defmt::error!("Erase failed:");
+
+                match e {
+                    FlashError::Busy => defmt::info!("busy."),
+                    FlashError::Illegal => defmt::info!("illegal."),
+                    FlashError::EccError => defmt::info!("ecc err."),
+                    FlashError::PageOutOfRange => defmt::info!("page oor."),
+                    FlashError::Failure => defmt::info!("failure."),
+                }
+
+                return Err(());
+            }
+        } else {
+            defmt::warn!("Skipped actual settings erase! Pretend it's good.");
+        }
+
+        if !SKIP_FLASH {
+            self.flash.write(settings_start, &self.buffer[..256]).map_err(|_| {
+                defmt::error!("Write failed!");
+            })?;
+        } else {
+            defmt::warn!("Skipped actual settings write! Pretend it's good.");
+        }
+
+        Ok(true)
+    }
+
+    fn reboot(&mut self) -> Result<bool, ()> {
+        if !SKIP_FLASH {
+            // TODO: Clear RAM flags?
+            SCB::sys_reset()
+        } else {
+            panic!("Bootload complete!");
+        }
+    }
+
     fn start_txfr(&mut self, addr: u8) -> StateQueue {
         match addr {
             // * Write transactions:
@@ -823,7 +934,26 @@ impl BootMachine {
                 ])
             }
 
-            //     * 0x42 - reboot to new image
+            //     * 0x42 - complete and reboot
+            0x42 => {
+                defmt::info!("Complete and Reboot");
+                if !self.map.bootload_complete() {
+                    defmt::error!("Bootload not complete! Not rebooting.");
+
+                    StateQueue::from_slice(&[
+                        StateQueueItem(BootMachine::wait_for_stop),
+                        StateQueueItem(BootMachine::match_address_write),
+                        StateQueueItem(BootMachine::match_write_register),
+                    ])
+                } else {
+                    StateQueue::from_slice(&[
+                        StateQueueItem(BootMachine::wait_for_stop),
+                        StateQueueItem(BootMachine::disable_i2c),
+                        StateQueueItem(BootMachine::write_settings_page),
+                        StateQueueItem(BootMachine::reboot),
+                    ])
+                }
+            }
             //     * 0x43 - abort bootload
             //         * No data
             //     * 0x44 - Offer image downstream
