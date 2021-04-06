@@ -126,75 +126,6 @@ fn inner_main() -> Result<(), ()> {
     let board = stm32::Peripherals::take().ok_or(())?;
     let mut core = stm32::CorePeripherals::take().ok_or(())?;
 
-    cortex_m::interrupt::disable();
-
-    let config = Config::pll()
-        .pll_cfg(PllConfig::with_hsi(1, 8, 2))
-        .ahb_psc(Prescaler::NotDivided)
-        .apb_psc(Prescaler::NotDivided);
-    let mut rcc = board.RCC.freeze(config);
-
-
-    let gpioa = board.GPIOA.split(&mut rcc);
-    let gpiob = board.GPIOB.split(&mut rcc);
-    let gpioc = board.GPIOC.split(&mut rcc);
-
-    let mut timer1 = board.TIM1.pwm(4096.hz(), &mut rcc);
-    let mut timer16 = board.TIM16.pwm(4096.hz(), &mut rcc);
-
-    let _gpio1 = gpioa.pa1;
-    let _uart_tx = gpioa.pa2;
-    let _uart_rx = gpioa.pa3;
-    let smartled = gpioa.pa4;
-    let _gpio2 = gpioa.pa5;
-    let _gpio3 = gpioa.pa6;
-    let _gpio4 = gpioa.pa7;
-    let _gpio7 = gpioa.pa8;
-    // let i2c2_scl = gpioa.pa9; // note: shadows pa11
-    // let i2c2_sda = gpioa.pa10; // note: shadows pa12
-    let i2c2_scl = gpioa.pa11; // note: shadows pa11
-    let i2c2_sda = gpioa.pa12; // note: shadows pa12
-    // let _ = gpioa.pa11; // see above
-    // let _ = gpioa.pa12; // see above
-    let _swdio = gpioa.pa13;
-    let _swclk = gpioa.pa14; // also boot0
-    let _spi_csn = gpioa.pa15;
-
-    let _gpio5 = gpiob.pb0;
-    let _gpio6 = gpiob.pb1;
-    let _spi_sck = gpiob.pb3;
-    let _spi_cipo = gpiob.pb4;
-    let _spi_copi = gpiob.pb5;
-    let _i2c1_scl = gpiob.pb6;
-    let _i2c1_sda = gpiob.pb7;
-    let mut led1 = gpioa.pa0.into_push_pull_output();
-    let mut led2 = gpiob.pb8.into_push_pull_output();
-    // Other pins not on this chip: PB2, PB9-15
-
-    let _gpio8 = gpioc.pc6;
-    let button1 = gpioc.pc14.into_floating_input();
-    let button2 = gpioc.pc15.into_floating_input();
-    // Other pins not on this chip: PC0-5, PC7-13
-
-    // No gpiod or gpioe
-    // gpiof: only PF2 is available as nRST, not used
-
-    let mut duty: u16 = 0;
-    let mut is_pwm_on = false;
-    let mut last_b1 = false;
-    let mut last_b2 = false;
-
-    let mut i2c = I2CPeripheral::new(
-        board.I2C2,
-        i2c2_sda,
-        i2c2_scl,
-        &mut rcc,
-    );
-
-    GlobalRollingTimer::init(board.TIM2);
-    let ght = GlobalRollingTimer::new();
-    let mut start = ght.get_ticks();
-    let mut ct = 0;
 
     // TODO: Probably don't need to do this at boot
     let mut flash = if let Ok(ulf) = board.FLASH.unlock() {
@@ -207,17 +138,7 @@ fn inner_main() -> Result<(), ()> {
 
     // Read RAM settings
     let mut stay_bootloader = false;
-
-    // Are both buttons held?
-    stay_bootloader |= {
-        let buttons_held = (Ok(true), Ok(true)) == (button1.is_low(), button2.is_low());
-
-        if buttons_held {
-            // defmt::info!("Holding in bootloader due to buttons!");
-        }
-
-        buttons_held
-    };
+    let mut force_bootloader = false;
 
     stay_bootloader |= {
         extern "C" {
@@ -243,6 +164,7 @@ fn inner_main() -> Result<(), ()> {
 
         if &0xCAFEB007u32.to_le_bytes() != &buf[..4] {
             // defmt::info!("No good RAM data.");
+            force_bootloader = true;
             false
         } else {
             match buf[4] {
@@ -250,6 +172,7 @@ fn inner_main() -> Result<(), ()> {
                 0x01 => false,
                 _ => {
                     // defmt::error!("Bad command! Staying in bootloader!");
+                    force_bootloader = true;
                     true
                 }
             }
@@ -336,26 +259,125 @@ fn inner_main() -> Result<(), ()> {
         }
     };
 
-    if !stay_bootloader {
+    if !stay_bootloader && !force_bootloader {
         defmt::info!("bootloading!");
         defmt::info!("MSP: {=u32:X}", settings_msp);
         defmt::info!("RSV: {=u32:X}", settings_rsv);
 
         unsafe {
-            for _ in 0..4 {
-                led1.set_high().ok();
-                led2.set_low().ok();
+            // for _ in 0..4 {
+            //     led1.set_high().ok();
+            //     led2.set_low().ok();
 
-                cortex_m::asm::delay(64_000_000 / 8);
+            //     cortex_m::asm::delay(64_000_000 / 8);
 
-                led1.set_low().ok();
-                led2.set_high().ok();
+            //     led1.set_low().ok();
+            //     led2.set_high().ok();
 
-                cortex_m::asm::delay(64_000_000 / 8);
-            }
+            //     cortex_m::asm::delay(64_000_000 / 8);
+            // }
             cortex_m::asm::bootstrap(settings_msp as *const u32, settings_rsv as *const u32);
         }
     }
+
+    cortex_m::interrupt::disable();
+
+    let config = Config::pll()
+        .pll_cfg(PllConfig::with_hsi(1, 8, 2))
+        .ahb_psc(Prescaler::NotDivided)
+        .apb_psc(Prescaler::NotDivided);
+    let mut rcc = board.RCC.freeze(config);
+
+
+    let gpioa = board.GPIOA.split(&mut rcc);
+    let gpiob = board.GPIOB.split(&mut rcc);
+    let gpioc = board.GPIOC.split(&mut rcc);
+
+    let mut timer1 = board.TIM1.pwm(4096.hz(), &mut rcc);
+    let mut timer16 = board.TIM16.pwm(4096.hz(), &mut rcc);
+
+    let _gpio1 = gpioa.pa1;
+    let _uart_tx = gpioa.pa2;
+    let _uart_rx = gpioa.pa3;
+    let smartled = gpioa.pa4;
+    let _gpio2 = gpioa.pa5;
+    let _gpio3 = gpioa.pa6;
+    let _gpio4 = gpioa.pa7;
+    let _gpio7 = gpioa.pa8;
+    // let i2c2_scl = gpioa.pa9; // note: shadows pa11
+    // let i2c2_sda = gpioa.pa10; // note: shadows pa12
+    let i2c2_scl = gpioa.pa11; // note: shadows pa11
+    let i2c2_sda = gpioa.pa12; // note: shadows pa12
+    // let _ = gpioa.pa11; // see above
+    // let _ = gpioa.pa12; // see above
+    let _swdio = gpioa.pa13;
+    let _swclk = gpioa.pa14; // also boot0
+    let _spi_csn = gpioa.pa15;
+
+    let _gpio5 = gpiob.pb0;
+    let _gpio6 = gpiob.pb1;
+    let _spi_sck = gpiob.pb3;
+    let _spi_cipo = gpiob.pb4;
+    let _spi_copi = gpiob.pb5;
+    let _i2c1_scl = gpiob.pb6;
+    let _i2c1_sda = gpiob.pb7;
+    let mut led1 = gpioa.pa0.into_push_pull_output();
+    let mut led2 = gpiob.pb8.into_push_pull_output();
+    // Other pins not on this chip: PB2, PB9-15
+
+    let _gpio8 = gpioc.pc6;
+    let button1 = gpioc.pc14.into_floating_input();
+    let button2 = gpioc.pc15.into_floating_input();
+    // Other pins not on this chip: PC0-5, PC7-13
+
+    // No gpiod or gpioe
+    // gpiof: only PF2 is available as nRST, not used
+
+    let mut duty: u16 = 0;
+    let mut is_pwm_on = false;
+    let mut last_b1 = false;
+    let mut last_b2 = false;
+
+    // Are both buttons held?
+    if !force_bootloader {
+        let buttons_held = (Ok(true), Ok(true)) == (button1.is_low(), button2.is_low());
+
+        extern "C" {
+            static _ram_flags: u8;
+        }
+
+        let ram_flags_addr: *mut u8 = unsafe { &_ram_flags as *const _  as *mut _};
+
+
+        if buttons_held {
+
+            unsafe {
+                // HACK: reboot to clear PLLs if buttons are pressed
+                ram_flags_addr.cast::<u32>().write(0xCAFEB007);
+                ram_flags_addr.add(4).write(0x00);
+                SCB::sys_reset()
+            }
+        } else {
+            unsafe {
+                // HACK: reboot to clear PLLs if buttons are pressed
+                ram_flags_addr.cast::<u32>().write(0xCAFEB007);
+                ram_flags_addr.add(4).write(0x01);
+                SCB::sys_reset()
+            }
+        }
+    }
+
+    let mut i2c = I2CPeripheral::new(
+        board.I2C2,
+        i2c2_sda,
+        i2c2_scl,
+        &mut rcc,
+    );
+
+    GlobalRollingTimer::init(board.TIM2);
+    let ght = GlobalRollingTimer::new();
+    let mut start = ght.get_ticks();
+    let mut ct = 0;
 
     // defmt::info!("Launching bootloader!");
 
