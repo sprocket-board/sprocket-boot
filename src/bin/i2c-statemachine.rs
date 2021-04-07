@@ -17,29 +17,24 @@
 
 #![no_main]
 #![no_std]
-#![allow(unused_imports, dead_code, unused_variables, unused_mut)]
 
-use cortex_m::{asm::delay, peripheral::SCB};
-use sprocket_boot as _; // global logger + panicking-behavior + memory layout
-
-use groundhog::RollingTimer;
-use groundhog_stm32g031::GlobalRollingTimer;
-use smart_leds::{colors, gamma, SmartLedsWrite, RGB, RGB8};
-use ws2812_spi::{Ws2812, MODE};
+use cortex_m::peripheral::SCB;
+use sprocket_boot::{
+    self as _, // global logger + panicking-behavior + memory layout
+    sprkt_log,
+};
 
 use stm32g0xx_hal::i2c_periph::I2CPeripheral;
 use stm32g0xx_hal::{
-    flash::{self, Error as FlashError, FlashPage, Read, UnlockedFlash, WriteErase},
+    flash::{self, FlashPage, Read, UnlockedFlash, WriteErase, Error as FlashError},
     gpio::{
-        gpioa::{PA0, PA11, PA12},
+        gpioa::PA0,
         gpiob::PB8,
-        Analog, Output, PushPull,
+        Output, PushPull,
     },
     prelude::*,
-    rcc::{Config, PllConfig, Prescaler, SysClockSrc},
-    spi::{NoMiso, NoSck, Spi},
-    stm32::{self, DWT, I2C2, SPI2, TIM1},
-    timer::{stopwatch::Stopwatch, Timer},
+    rcc::{Config, PllConfig, Prescaler},
+    stm32,
 };
 
 const SKIP_FLASH: bool = false;
@@ -69,7 +64,7 @@ impl PageMap {
     }
 
     fn ready_to_write_vector_subpage(&self) -> bool {
-        // defmt::info!("map: {:?}", self.pages);
+        sprkt_log!(info, "map: {:?}", self.pages);
 
         if !(self.unlocked && self.active_pages > 0) {
             return false;
@@ -128,7 +123,7 @@ fn inner_main() -> Result<(), ()> {
 
         let ram_flags_addr: *mut u8 = unsafe { &_ram_flags as *const _ as *mut _ };
         let buffer_addr: *mut u8 = buf.as_mut_ptr();
-        // defmt::info!("Loading ram page at {=u32:X}", ram_flags_addr as u32);
+        sprkt_log!(info, "Loading ram page at {=u32:X}", ram_flags_addr as u32);
 
         unsafe {
             core::ptr::copy_nonoverlapping(ram_flags_addr, buffer_addr, 128);
@@ -143,21 +138,21 @@ fn inner_main() -> Result<(), ()> {
         // Step 1.2: Check magic word. If it is set, check the boot command flag
         //
         if &0xCAFEB007u32.to_le_bytes() != &buf[..4] {
-            // defmt::info!("No good RAM data.");
+            sprkt_log!(info, "No good RAM data.");
         } else {
             match buf[4] {
                 0x00 => {
                     // A zero means STAY IN BOOTLOADER
-                    // defmt::info!("RAM: Stay in bootloader");
+                    sprkt_log!(info, "RAM: Stay in bootloader");
                     decision = Some(BootDecision::ForceBootload);
                 }
                 0x01 => {
                     // A one means BOOT TO APP
-                    // defmt::info!("RAM: Attempt boot");
+                    sprkt_log!(info, "RAM: Attempt boot");
                     decision = Some(BootDecision::BootApp);
                 }
                 _ => {
-                    // defmt::warn!("RAM: Invalid!");
+                    sprkt_log!(warn, "RAM: Invalid!");
                     // Don't trust invalid variants. Keep the decision None.
                     //
                     // TODO: We could also treat this as "force bootloader"? Not
@@ -176,7 +171,6 @@ fn inner_main() -> Result<(), ()> {
     //
     // TODO: We should probably be restoring/disabling anything we use here.
     let board = stm32::Peripherals::take().ok_or(())?;
-    let mut core = stm32::CorePeripherals::take().ok_or(())?;
 
     //
     // Step 2.1 - Unlock Flash access
@@ -184,11 +178,11 @@ fn inner_main() -> Result<(), ()> {
 
     // TODO: We can probably just do volatile reads without using the flash
     // peripheral at all.
-    let mut flash = if let Ok(ulf) = board.FLASH.unlock() {
-        // defmt::info!("unlocked.");
+    let flash = if let Ok(ulf) = board.FLASH.unlock() {
+        sprkt_log!(info, "unlocked.");
         ulf
     } else {
-        // defmt::error!("Unlock failed!");
+        sprkt_log!(error, "Unlock failed!");
 
         // Delay a little time so we don't reboot TOO fast
         cortex_m::asm::delay(8_000_000);
@@ -228,10 +222,10 @@ fn inner_main() -> Result<(), ()> {
         let good_rsv = settings_rsv != 0xFFFFFFFFu32;
 
         if good_magic && good_msp && good_rsv {
-            // defmt::info!("Good Settings data");
+            sprkt_log!(info, "Good Settings data");
             Some((settings_msp, settings_rsv))
         } else {
-            // defmt::warn!("Bad Settings data");
+            sprkt_log!(warn, "Bad Settings data");
             decision = Some(BootDecision::ForceBootload);
             None
         }
@@ -295,9 +289,9 @@ fn inner_main() -> Result<(), ()> {
             let good_stg_rsv = stg_rsv != 0xFFFFFFFF;
 
             if good_app_msp && good_app_rsv && good_stg_msp && good_stg_rsv {
-                // defmt::info!("bootloading!");
-                // defmt::info!("MSP: {=u32:X}", stg_msp);
-                // defmt::info!("RSV: {=u32:X}", stg_rsv);
+                sprkt_log!(info, "bootloading!");
+                sprkt_log!(info, "MSP: {=u32:X}", stg_msp);
+                sprkt_log!(info, "RSV: {=u32:X}", stg_rsv);
 
                 unsafe {
                     cortex_m::asm::bootstrap(
@@ -306,12 +300,12 @@ fn inner_main() -> Result<(), ()> {
                     );
                 }
             } else {
-                // defmt::info!("Cross Check of values failed. Bootloading.");
+                sprkt_log!(info, "Cross Check of values failed. Bootloading.");
                 decision = Some(BootDecision::ForceBootload);
             }
         }
     } else {
-        // defmt::info!("Bad Settings. Bootloading.");
+        sprkt_log!(info, "Bad Settings. Bootloading.");
         decision = Some(BootDecision::ForceBootload);
     }
 
@@ -332,7 +326,7 @@ fn inner_main() -> Result<(), ()> {
     // Step 3.1 - Check buttons if we aren't sure about what to do yet
     //
     if decision.is_none() {
-        // defmt::info!("Decision unclear, checking buttons.");
+        sprkt_log!(info, "Decision unclear, checking buttons.");
         // Are both buttons held, signaling "stay in bootloader"?
         let buttons_held = (Ok(true), Ok(true)) == (button1.is_low(), button2.is_low());
 
@@ -344,7 +338,7 @@ fn inner_main() -> Result<(), ()> {
 
         // Nope!
         if !buttons_held {
-            // defmt::info!("No buttons, reboot with commanded boot to app");
+            sprkt_log!(info, "No buttons, reboot with commanded boot to app");
             unsafe {
                 // HACK: reboot to clear PLLs if buttons are pressed
                 ram_flags_addr.cast::<u32>().write(0xCAFEB007);
@@ -354,7 +348,7 @@ fn inner_main() -> Result<(), ()> {
                 SCB::sys_reset()
             }
         } else {
-            // defmt::info!("Buttons pressed. Bootloading.");
+            sprkt_log!(info, "Buttons pressed. Bootloading.");
         }
     }
 
@@ -365,21 +359,16 @@ fn inner_main() -> Result<(), ()> {
     let gpioa = board.GPIOA.split(&mut rcc);
     let gpiob = board.GPIOB.split(&mut rcc);
 
-    let smartled = gpioa.pa4;
     let i2c2_scl = gpioa.pa11; // note: shadows pa9
     let i2c2_sda = gpioa.pa12; // note: shadows pa10
     let mut led1 = gpioa.pa0.into_push_pull_output();
     let mut led2 = gpiob.pb8.into_push_pull_output();
+    led1.set_low().ok();
+    led2.set_low().ok();
 
-    let mut i2c = I2CPeripheral::new(board.I2C2, i2c2_sda, i2c2_scl, &mut rcc);
+    let i2c = I2CPeripheral::new(board.I2C2, i2c2_sda, i2c2_scl, &mut rcc);
 
-    GlobalRollingTimer::init(board.TIM2);
-    let ght = GlobalRollingTimer::new();
-
-    let mut start = ght.get_ticks();
-    let mut ct = 0;
-
-    // defmt::info!("Launching bootloader!");
+    sprkt_log!(info, "Launching bootloader!");
 
     let mut boot = BootMachine::new(i2c, flash, led1, led2);
 
@@ -407,18 +396,8 @@ fn main() -> ! {
     SCB::sys_reset()
 }
 
-#[inline(always)]
-fn every_n_ms(time: u32, interval: u32) -> bool {
-    if time == 0 {
-        false
-    } else {
-        (time % interval) == 0
-    }
-}
-
 struct BootMachine {
     i2c: I2CPeripheral,
-    timer: GlobalRollingTimer,
     transfer: Transfer,
     buffer: [u8; 512],
     flash: UnlockedFlash,
@@ -440,7 +419,6 @@ enum Transfer {
     Idle,
     Writing { addr: u8, len: usize, idx: usize },
     Reading { addr: u8, len: usize, idx: usize },
-    Invalid,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -461,16 +439,8 @@ impl Default for StateQueueItem {
 }
 
 fn nop_state_err<T>(_: &mut BootMachine) -> Result<T, ()> {
-    // defmt::error!("Nop state error!");
+    sprkt_log!(error, "Nop state error!");
     Err(())
-}
-
-fn nop_state_ok(_: &mut BootMachine) -> Result<(), ()> {
-    Ok(())
-}
-
-fn nop_state_true(_: &mut BootMachine) -> Result<bool, ()> {
-    Ok(true)
 }
 
 const ITEMS: usize = 8;
@@ -498,7 +468,7 @@ impl StateQueue {
     }
 
     fn from_slice(items: &[StateQueueItem]) -> Self {
-        assert!(items.len() <= 8, "Increase Queue Size!");
+        // assert!(items.len() <= 8, "Increase Queue Size!");
 
         let mut new = Self::new();
         new.idx = 0;
@@ -522,17 +492,13 @@ impl StateQueue {
 
     fn push(&mut self, item: StateQueueItem) -> Result<(), ()> {
         if self.idx == ITEMS {
-            // defmt::error!("Push fail!");
+            sprkt_log!(error, "Push fail!");
             return Err(());
         }
 
         self.items[self.idx] = item;
         self.idx += 1;
         Ok(())
-    }
-
-    fn len(&self) -> usize {
-        self.idx
     }
 }
 
@@ -547,7 +513,6 @@ impl BootMachine {
             i2c,
             flash,
             buffer: [0u8; 512],
-            timer: GlobalRollingTimer::new(),
             transfer: Transfer::Idle,
             map: PageMap {
                 pages: [0; TOTAL_PAGES],
@@ -570,12 +535,13 @@ impl BootMachine {
         let (addr, mut idx, len) = if let Transfer::Writing { addr, len, idx } = &self.transfer {
             (*addr, *idx, *len)
         } else {
-            // defmt::error!("Wrong state for complete_write!");
+            sprkt_log!(error, "Wrong state for complete_write!");
             return Err(());
         };
 
         if idx >= len {
-            panic!("Why are you writing more")
+            yeet()
+            // panic!("Why are you writing more")
         }
 
         let i2cpac = self.i2c.borrow_pac();
@@ -593,10 +559,10 @@ impl BootMachine {
         //
         // TODO: wat
         //
-        // defmt::info!("Wrote byte {:?}/{:?}", idx, len);
+        // sprkt_log!(info, "Wrote byte {:?}/{:?}", idx, len);
 
         if idx >= len {
-            // defmt::info!("Done! Waiting for stop");
+            sprkt_log!(info, "Done! Waiting for stop");
             Ok(true)
         } else {
             self.transfer = Transfer::Writing { addr, len, idx };
@@ -608,7 +574,7 @@ impl BootMachine {
         let (addr, mut idx, len) = if let Transfer::Reading { addr, len, idx } = &self.transfer {
             (*addr, *idx, *len)
         } else {
-            // defmt::error!("wrong state!");
+            sprkt_log!(error, "wrong state!");
             return Err(());
         };
 
@@ -620,7 +586,8 @@ impl BootMachine {
         }
 
         if idx >= len {
-            panic!("Bounds checking failure")
+            yeet()
+            // panic!("Bounds checking failure")
         }
 
         i2cpac
@@ -644,21 +611,21 @@ impl BootMachine {
         // Is the controller asking us for more data still?
         if isr.txis().bit_is_set() {
             self.nak();
-            // defmt::error!("asked for more read when stop expected!");
+            sprkt_log!(error, "asked for more read when stop expected!");
             i2cpac.txdr.modify(|_, w| unsafe { w.txdata().bits(0) });
         }
 
         // Is the controller giving us more data still?
         if isr.rxne().bit_is_clear() {
             self.nak();
-            // defmt::error!("got write when stop expected!");
+            sprkt_log!(error, "got write when stop expected!");
             let _ = i2cpac.rxdr.read().rxdata().bits();
         }
 
         // Is the controller finally done?
         if i2cpac.isr.read().stopf().bit_is_set() {
             i2cpac.icr.write(|w| w.stopcf().set_bit());
-            // defmt::info!("got stop.");
+            sprkt_log!(info, "got stop.");
             Ok(true)
         } else {
             Ok(false)
@@ -693,12 +660,14 @@ impl BootMachine {
     }
 
     fn poll_inner(&mut self) -> Result<(), ()> {
-        let mut action = self.sq.pop().unwrap(); // TODO
+        let action = self.sq.pop().unwrap_or_else(|| {
+            yeet()
+        });
 
         if !(action.0)(self)? {
             let x = self.sq.push(action);
             if x.is_err() {
-                // defmt::error!("Queue is full???");
+                sprkt_log!(error, "Queue is full???");
             }
 
             x?;
@@ -711,7 +680,8 @@ impl BootMachine {
         match self.poll_inner() {
             Ok(()) => Ok(()),
             Err(()) => {
-                todo!("clear the queue, go into some kind of recovery?");
+                yeet()
+                // todo!("clear the queue, go into some kind of recovery?");
             }
         }
     }
@@ -723,28 +693,28 @@ impl BootMachine {
         let (page, subpage) = if let BootLoadAction::EraseThenWrite { page, subpage } = old_action {
             (page, subpage)
         } else {
-            // defmt::error!("Tried to erase when not prepared!");
+            sprkt_log!(error, "Tried to erase when not prepared!");
             return Err(());
         };
 
-        // defmt::info!("erasing page {=u32}...", page as u32);
+        sprkt_log!(info, "erasing page {=u32}...", page as u32);
 
         if !SKIP_FLASH {
             if let Err(e) = self.flash.erase_page(FlashPage(page)) {
-                // defmt::error!("Erase failed:");
+                sprkt_log!(error, "Erase failed:");
 
                 match e {
-                    FlashError::Busy => defmt::info!("busy."),
-                    FlashError::Illegal => defmt::info!("illegal."),
-                    FlashError::EccError => defmt::info!("ecc err."),
-                    FlashError::PageOutOfRange => defmt::info!("page oor."),
-                    FlashError::Failure => defmt::info!("failure."),
-                }
+                    FlashError::Busy => sprkt_log!(info, "busy."),
+                    FlashError::Illegal => sprkt_log!(info, "illegal."),
+                    FlashError::EccError => sprkt_log!(info, "ecc err."),
+                    FlashError::PageOutOfRange => sprkt_log!(info, "page oor."),
+                    FlashError::Failure => sprkt_log!(info, "failure."),
+                };
 
                 return Err(());
             }
         } else {
-            // defmt::warn!("Skipped actual erase! Pretend it's good.");
+            sprkt_log!(warn, "Skipped actual erase! Pretend it's good.");
         }
 
         // Erase good! Move on to write. We unconditionally write after an erase
@@ -760,14 +730,14 @@ impl BootMachine {
         let (page, subpage) = if let BootLoadAction::Writing { page, subpage } = old_action {
             (page, subpage)
         } else {
-            // defmt::error!("Tried to write when not prepared!");
+            sprkt_log!(error, "Tried to write when not prepared!");
             return Err(());
         };
 
         let subpage_image = &self.buffer[1..257];
 
         if subpage_image.iter().all(|b| *b == 0xFF) {
-            // defmt::info!("Page is all 0xFF, skipping write");
+            sprkt_log!(info, "Page is all 0xFF, skipping write");
             return Ok(true);
         }
 
@@ -781,15 +751,15 @@ impl BootMachine {
         let store_addr =
             (app_start + (page * flash::PAGE_SIZE as usize)) + (subpage as usize * 256);
 
-        // defmt::info!("Writing subpage at {=u32:X}...", store_addr as u32);
+        sprkt_log!(info, "Writing subpage at {=u32:X}...", store_addr as u32);
 
         if !SKIP_FLASH {
             self.flash.write(store_addr, subpage_image).map_err(|_| {
-                // defmt::error!("Write failed!");
+                sprkt_log!(error, "Write failed!");
             })?;
         } else {
-            // defmt::warn!("Skipped actual write! Pretend it's good.");
-            // defmt::info!("page: {:?}", subpage_image);
+            sprkt_log!(warn, "Skipped actual write! Pretend it's good.");
+            sprkt_log!(info, "page: {:?}", subpage_image);
         }
 
         Ok(true)
@@ -797,7 +767,7 @@ impl BootMachine {
 
     fn enable_i2c(&mut self) -> Result<bool, ()> {
         if self.i2c.is_enabled() {
-            // defmt::error!("Oops, expected to be disabled but we're not");
+            sprkt_log!(error, "Oops, expected to be disabled but we're not");
             return Err(());
         }
         unsafe {
@@ -808,7 +778,7 @@ impl BootMachine {
 
     fn disable_i2c(&mut self) -> Result<bool, ()> {
         if !self.i2c.is_enabled() {
-            // defmt::error!("Oops, expected to be enabled but we're not");
+            sprkt_log!(error, "Oops, expected to be enabled but we're not");
             return Err(());
         }
         unsafe {
@@ -821,19 +791,19 @@ impl BootMachine {
         // Is bootloading active?
         // TODO: This duplicates the get_page_mut check
         if !self.map.unlocked {
-            // defmt::error!("Bootloading not started!");
+            sprkt_log!(error, "Bootloading not started!");
             return Err(());
         }
 
-        let (addr, mut idx, len) = if let Transfer::Writing { addr, len, idx } = &self.transfer {
-            (*addr, *idx, *len)
+        let len = if let Transfer::Writing { len, .. } = &self.transfer {
+            *len
         } else {
-            // defmt::error!("Wrong state for check_write_page_data!");
+            sprkt_log!(error, "Wrong state for check_write_page_data!");
             return Err(());
         };
 
         if len != (1 + 256 + 4) {
-            // defmt::error!("Wrong number of bytes!");
+            sprkt_log!(error, "Wrong number of bytes!");
             return Err(());
         }
         // * 1: Page/Subpage
@@ -846,8 +816,8 @@ impl BootMachine {
         let page = (ps >> 3) as usize;
         let subpage = ps & 0b111;
 
-        assert!(page < TOTAL_PAGES);
-        assert!((subpage as usize) < SUBPAGES_PER_PAGE);
+        // assert!(page < TOTAL_PAGES);
+        // assert!((subpage as usize) < SUBPAGES_PER_PAGE);
 
         let mut checksum_unchecked_bytes = [0u8; 4];
         checksum_unchecked_bytes.copy_from_slice(&self.buffer[257..261]);
@@ -856,7 +826,7 @@ impl BootMachine {
         let calc_checksum = generate_checksum(&self.buffer[1..257], None).ok_or(())?;
 
         if calc_checksum != checksum_unchecked {
-            // defmt::error!("Checksum mismatch!");
+            sprkt_log!(error, "Checksum mismatch!");
             return Err(());
         }
 
@@ -867,15 +837,15 @@ impl BootMachine {
             }
 
             if !self.map.ready_to_write_vector_subpage() {
-                // defmt::error!("Must write page 0 subpage 0 last!");
+                sprkt_log!(error, "Must write page 0 subpage 0 last!");
                 return Err(());
             }
 
             let reset_vector = unsafe { &PreResetTrampoline as *const _ as usize };
             let msp = unsafe { &_stack_start as *const _ as usize };
 
-            // defmt::info!("Patching reset vector to the bootloader's: {=usize:X}", reset_vector);
-            // defmt::info!("Patching MSP to the bootloader's: {=usize:X}", msp);
+            sprkt_log!(info, "Patching reset vector to the bootloader's: {=usize:X}", reset_vector);
+            sprkt_log!(info, "Patching MSP to the bootloader's: {=usize:X}", msp);
 
             let mut reset_vector_bytes = [0u8; 4];
             let mut msp_bytes = [0u8; 4];
@@ -893,7 +863,7 @@ impl BootMachine {
         let map = self.map.get_page_mut(page).ok_or(())?;
 
         if *map == 0 {
-            // defmt::info!("Subpage accepted. Erase + Flash started");
+            sprkt_log!(info, "Subpage accepted. Erase + Flash started");
             // All subpages have never been written, time to erase page
             *map = *map | (1 << subpage);
             self.sq = StateQueue::from_slice(&[
@@ -909,7 +879,7 @@ impl BootMachine {
             self.flash_action = BootLoadAction::EraseThenWrite { page, subpage };
             Ok(true)
         } else if (*map & 1 << subpage) == 0 {
-            // defmt::info!("Subpage accepted. Flash started");
+            sprkt_log!(info, "Subpage accepted. Flash started");
             *map = *map | (1 << subpage);
 
             self.sq = StateQueue::from_slice(&[
@@ -924,7 +894,7 @@ impl BootMachine {
             self.flash_action = BootLoadAction::Writing { page, subpage };
             Ok(true)
         } else {
-            // defmt::error!("Can't re-write pages!");
+            sprkt_log!(error, "Can't re-write pages!");
             Err(())
         }
     }
@@ -933,35 +903,36 @@ impl BootMachine {
         let len = if let Transfer::Writing { len, .. } = self.transfer {
             len
         } else {
-            // defmt::error!("Wrong state!");
+            sprkt_log!(error, "Wrong state!");
             return Err(());
         };
 
         if len != 5 {
-            // defmt::error!("Wrong number of bytes!");
+            sprkt_log!(error, "Wrong number of bytes!");
             return Err(());
         }
 
         let mut checksum_bytes = [0u8; 4];
         checksum_bytes.copy_from_slice(&self.buffer[..4]);
 
-        let checksum = u32::from_le_bytes(checksum_bytes);
+        // TODO: Use global checksum!
+        let _checksum = u32::from_le_bytes(checksum_bytes);
         let subpages = self.buffer[4];
 
         if subpages as usize > TOTAL_SUBPAGES {
-            // defmt::error!("Too many subpages!");
+            sprkt_log!(error, "Too many subpages!");
             return Err(());
         }
 
         if subpages % (SUBPAGES_PER_PAGE as u8) != 0 {
-            // defmt::error!("Must provide whole page!");
+            sprkt_log!(error, "Must provide whole page!");
             return Err(());
         }
 
         let pages = (subpages >> 3) as usize;
 
         if self.map.unlocked {
-            // defmt::warn!("Already unlocked, resetting programming!");
+            sprkt_log!(warn, "Already unlocked, resetting programming!");
         }
 
         self.map.pages.iter_mut().for_each(|b| {
@@ -971,18 +942,9 @@ impl BootMachine {
         self.map.unlocked = true;
         self.map.active_pages = pages;
 
-        // defmt::info!("Unlocked Bootloading; pages: {=u8}, checksum: {=u32:X}", subpages, checksum);
+        sprkt_log!(info, "Unlocked Bootloading; pages: {=u8}, checksum: {=u32:X}", subpages, _checksum);
 
         Ok(true)
-    }
-
-    fn dummy_read(&mut self) {
-        // defmt::info!("Dummy read!");
-    }
-
-    fn dummy_write(&mut self, len: usize) {
-        let good_buf = &self.buffer[..len];
-        // defmt::info!("Dummy write of {:?} bytes!", len);
     }
 
     fn write_settings_page(&mut self) -> Result<bool, ()> {
@@ -992,20 +954,20 @@ impl BootMachine {
 
         let settings_start = unsafe { &_settings_start as *const _ as usize };
 
-        // defmt::info!("Reading settings page...");
+        sprkt_log!(info, "Reading settings page...");
 
         if !SKIP_FLASH {
             self.flash.read(settings_start, &mut self.buffer[..256]);
         } else {
-            // defmt::warn!("Skipping real settings read! Loading all 0xFFs");
+            sprkt_log!(warn, "Skipping real settings read! Loading all 0xFFs");
             self.buffer[..256].iter_mut().for_each(|b| *b = 0xFF);
         }
 
         // TODO: actual serialization/deserialization of settings page
-        // defmt::warn!("Manually applying new reset vector and msp to settings page");
+        sprkt_log!(warn, "Manually applying new reset vector and msp to settings page");
 
-        // defmt::info!("App MSP: {=usize:X}", self.map.msp);
-        // defmt::info!("App RsV: {=usize:X}", self.map.reset_vector);
+        sprkt_log!(info, "App MSP: {=usize:X}", self.map.msp);
+        sprkt_log!(info, "App RsV: {=usize:X}", self.map.reset_vector);
 
         self.buffer[..4].copy_from_slice(&0xB007CAFEu32.to_le_bytes());
         self.buffer[4..8].copy_from_slice(&self.map.msp.to_le_bytes());
@@ -1019,30 +981,30 @@ impl BootMachine {
 
         if !SKIP_FLASH {
             if let Err(e) = self.flash.erase_page(FlashPage(real_page)) {
-                // defmt::error!("Erase failed:");
+                sprkt_log!(error, "Erase failed:");
 
                 match e {
-                    FlashError::Busy => defmt::info!("busy."),
-                    FlashError::Illegal => defmt::info!("illegal."),
-                    FlashError::EccError => defmt::info!("ecc err."),
-                    FlashError::PageOutOfRange => defmt::info!("page oor."),
-                    FlashError::Failure => defmt::info!("failure."),
+                    FlashError::Busy => sprkt_log!(info, "busy."),
+                    FlashError::Illegal => sprkt_log!(info, "illegal."),
+                    FlashError::EccError => sprkt_log!(info, "ecc err."),
+                    FlashError::PageOutOfRange => sprkt_log!(info, "page oor."),
+                    FlashError::Failure => sprkt_log!(info, "failure."),
                 }
 
                 return Err(());
             }
         } else {
-            // defmt::warn!("Skipped actual settings erase! Pretend it's good.");
+            sprkt_log!(warn, "Skipped actual settings erase! Pretend it's good.");
         }
 
         if !SKIP_FLASH {
             self.flash
                 .write(settings_start, &self.buffer[..256])
                 .map_err(|_| {
-                    // defmt::error!("Write failed!");
+                    sprkt_log!(error, "Write failed!");
                 })?;
         } else {
-            // defmt::warn!("Skipped actual settings write! Pretend it's good.");
+            sprkt_log!(warn, "Skipped actual settings write! Pretend it's good.");
         }
 
         Ok(true)
@@ -1067,7 +1029,8 @@ impl BootMachine {
 
             SCB::sys_reset()
         } else {
-            panic!("Bootload complete!");
+            yeet()
+            // panic!("Bootload complete!");
         }
     }
 
@@ -1080,7 +1043,7 @@ impl BootMachine {
             //     * 1 byte - total subpages to write
             //         * NOTE: must be less than 23 * 8 for now
             0x40 => {
-                // defmt::info!("Start Bootload");
+                sprkt_log!(info, "Start Bootload");
                 self.transfer = Transfer::Writing {
                     addr,
                     len: 5,
@@ -1111,7 +1074,7 @@ impl BootMachine {
             //         * Make sure MSP is maxval?
             //         * 0:0 must be the last thing written
             0x41 => {
-                // defmt::info!("Write Page");
+                sprkt_log!(info, "Write Page");
                 self.transfer = Transfer::Writing {
                     addr,
                     len: 1 + 256 + 4,
@@ -1126,9 +1089,9 @@ impl BootMachine {
 
             //     * 0x42 - complete and reboot
             0x42 => {
-                // defmt::info!("Complete and Reboot");
+                sprkt_log!(info, "Complete and Reboot");
                 if !self.map.bootload_complete() {
-                    // defmt::error!("Bootload not complete! Not rebooting.");
+                    sprkt_log!(error, "Bootload not complete! Not rebooting.");
 
                     StateQueue::from_slice(&[
                         StateQueueItem(BootMachine::wait_for_stop),
@@ -1153,7 +1116,7 @@ impl BootMachine {
             //     * wr-then-rd 0x10 + 16 bytes => b'sprocket boot!!!'
             0x10 => {
                 const ID: &[u8] = b"sprocket boot!!!";
-                // defmt::info!("Got 0x10 write, going to read");
+                sprkt_log!(info, "Got 0x10 write, going to read");
 
                 (&mut self.buffer[..ID.len()]).copy_from_slice(ID);
 
@@ -1178,8 +1141,9 @@ impl BootMachine {
             //     * wr-then-rd 0x22 + 1 byte => status
             //     * wr-then-rd 0x23 + 4 bytes => children flashed
             _ => {
-                // defmt::info!("Unexpected command: {=u8}", addr);
-                todo!()
+                sprkt_log!(info, "Unexpected command: {=u8}", addr);
+                // todo!()
+                yeet()
             }
         }
     }
@@ -1194,7 +1158,7 @@ impl BootMachine {
         if i2cpac.isr.read().addcode().bits() != 0x69 {
             self.nak();
             self.ack_addr_match();
-            // defmt::error!("Address Mismatch!");
+            sprkt_log!(error, "Address Mismatch!");
             return false;
         }
 
@@ -1210,13 +1174,13 @@ impl BootMachine {
         if dir != direction {
             self.nak();
             self.ack_addr_match();
-            // defmt::error!("Direction Mismatch!");
+            sprkt_log!(error, "Direction Mismatch!");
             false
         } else {
             // Clear a NAK
             i2cpac.cr2.write(|w| w.nack().clear_bit());
 
-            // defmt::info!("Acked a correct address+direction");
+            sprkt_log!(info, "Acked a correct address+direction");
             if direction == TransferDir::Read {
                 i2cpac.isr.write(|w| w.txe().set_bit());
             }
@@ -1265,4 +1229,10 @@ fn generate_checksum(data: &[u8], with_starting: Option<u32>) -> Option<u32> {
     }
 
     Some(checksum)
+}
+
+#[inline(always)]
+fn yeet() -> ! {
+    // SCB::sys_reset()
+    sprocket_boot::exit()
 }
