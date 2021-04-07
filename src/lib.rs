@@ -4,8 +4,11 @@
 use stm32g0xx_hal as _; // memory layout
 
 #[macro_use] pub mod log;
+pub mod boot_machine;
+pub mod page_map;
+pub mod consts;
 
-#[cfg(feature = "defmt")]
+#[cfg(feature = "defmt-log")]
 mod defmt {
     use core::sync::atomic::{AtomicUsize, Ordering};
     use defmt_rtt as _; // global logger
@@ -31,9 +34,35 @@ mod defmt {
 #[cfg(feature = "panic-reset")]
 use panic_reset as _;
 
+const SKIP_FLASH: bool = cfg!(feature = "skip-flash");
+const TOTAL_PAGES: usize = 24;
+
+// TODO: You REALLY can't change this, because I am bit-packing
+const SUBPAGES_PER_PAGE: usize = 8;
+
+const TOTAL_SUBPAGES: usize = TOTAL_PAGES * SUBPAGES_PER_PAGE;
+
+
 /// Terminates the application and makes `probe-run` exit with exit-code = 0
 pub fn exit() -> ! {
     loop {
         cortex_m::asm::bkpt();
     }
+}
+
+// TODO: Replace me with something better like CRC
+fn generate_checksum(data: &[u8], with_starting: Option<u32>) -> Option<u32> {
+    if data.len() != 256 {
+        return None;
+    }
+
+    let mut checksum = with_starting.unwrap_or(0xB007B007u32);
+    for chunk in data.chunks_exact(4) {
+        let mut word = [0u8; 4];
+        word.copy_from_slice(chunk);
+        let word = u32::from_le_bytes(word);
+        checksum = checksum.wrapping_add(word);
+    }
+
+    Some(checksum)
 }

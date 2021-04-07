@@ -37,13 +37,8 @@ version = "0.7.1"
 features = ["inline-asm"]
 
 [dependencies.stm32g0xx-hal]
-# git = "https://github.com/stm32-rs/stm32g0xx-hal.git"
-# branch = "master"
 path = "./vendor/stm32g0xx-hal"
 features = ["rt", "stm32g031"]
-
-# [dependencies.groundhog-stm32g031]
-# path = "./crates/groundhog-stm32g031"
 
 [features]
 # set logging levels here
@@ -56,6 +51,10 @@ default = [
 # NOTE: To use the `defmt-log` feature, you must also
 # modify `.cargo/config.toml` to add the defmt linker
 # section!
+#
+# If you're using defmt, you probably also want to set
+# the `skip-flash` feature, otherwise probe-run will
+# disconnect whenever we interact with the flash memory
 defmt-log = [
     "defmt",
     "defmt-rtt",
@@ -64,6 +63,9 @@ defmt-log = [
     # Set defmt log level
     "defmt-default",
 ]
+
+# Simulate flash operations for logging and testing
+skip-flash = []
 
 # do NOT modify these features
 defmt-default = []
