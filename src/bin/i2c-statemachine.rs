@@ -17,54 +17,29 @@
 
 #![no_main]
 #![no_std]
-
 #![allow(unused_imports, dead_code, unused_variables, unused_mut)]
 
-use core::iter::Cloned;
-use core::iter::Cycle;
-
-use cortex_m::peripheral::SCB;
+use cortex_m::{asm::delay, peripheral::SCB};
 use sprocket_boot as _; // global logger + panicking-behavior + memory layout
-use smart_leds::RGB;
-use stm32g0xx_hal::flash;
-use stm32g0xx_hal::flash::FlashPage;
-use stm32g0xx_hal::flash::Read;
-use stm32g0xx_hal::flash::UnlockedFlash;
-use stm32g0xx_hal::flash::WriteErase;
-use stm32g0xx_hal::flash::Error as FlashError;
-use stm32g0xx_hal::gpio::Analog;
-use stm32g0xx_hal::gpio::Output;
-use stm32g0xx_hal::gpio::PushPull;
-use stm32g0xx_hal::gpio::gpioa::PA0;
-use stm32g0xx_hal::gpio::gpioa::PA11;
-use stm32g0xx_hal::gpio::gpioa::PA12;
-use stm32g0xx_hal::gpio::gpiob::PB8;
-use stm32g0xx_hal::{
-    stm32::{self, DWT, SPI2, TIM1, I2C2},
-    prelude::*,
-    // adc::{Adc, config::AdcConfig},
-    spi::{Spi, NoSck, NoMiso},
-    // serial::{Serial, config::Config},
-    timer::{
-        Timer,
-        stopwatch::Stopwatch,
-    },
-    rcc::{
-        Config,
-        SysClockSrc,
-        PllConfig,
-        Prescaler,
-    },
-};
-use ws2812_spi::{Ws2812, MODE};
-use cortex_m::asm::delay;
-use smart_leds::{RGB8, SmartLedsWrite, colors, gamma};
 
 use groundhog::RollingTimer;
 use groundhog_stm32g031::GlobalRollingTimer;
+use smart_leds::{colors, gamma, SmartLedsWrite, RGB, RGB8};
+use ws2812_spi::{Ws2812, MODE};
 
-use stm32g0xx_hal::i2c_periph::{
-    I2CPeripheral,
+use stm32g0xx_hal::i2c_periph::I2CPeripheral;
+use stm32g0xx_hal::{
+    flash::{self, Error as FlashError, FlashPage, Read, UnlockedFlash, WriteErase},
+    gpio::{
+        gpioa::{PA0, PA11, PA12},
+        gpiob::PB8,
+        Analog, Output, PushPull,
+    },
+    prelude::*,
+    rcc::{Config, PllConfig, Prescaler, SysClockSrc},
+    spi::{NoMiso, NoSck, Spi},
+    stm32::{self, DWT, I2C2, SPI2, TIM1},
+    timer::{stopwatch::Stopwatch, Timer},
 };
 
 const SKIP_FLASH: bool = false;
@@ -102,8 +77,9 @@ impl PageMap {
 
         // TODO: I probably want to ensure that the vector table SUBPAGE is written first in this page, because
         // if we lose power, we could be in trouble.
-        self.pages[0] == 0xFE &&
-            self.pages
+        self.pages[0] == 0xFE
+            && self
+                .pages
                 .iter()
                 .skip(1)
                 .take(self.active_pages - 1)
@@ -111,45 +87,46 @@ impl PageMap {
     }
 
     fn bootload_complete(&self) -> bool {
-        self.unlocked &&
-            self.active_pages > 0 &&
-            self.pages
+        self.unlocked
+            && self.active_pages > 0
+            && self
+                .pages
                 .iter()
                 .take(self.active_pages)
                 .all(|p| *p == 0xFF)
     }
 }
 
+enum BootDecision {
+    ForceBootload,
+    BootApp,
+}
+
 fn inner_main() -> Result<(), ()> {
-    // defmt::info!("Hello, world!");
+    //
+    // Step 0: Start the boot decision process
+    //
+    cortex_m::interrupt::disable();
+    let mut decision: Option<BootDecision> = None;
 
-    let board = stm32::Peripherals::take().ok_or(())?;
-    let mut core = stm32::CorePeripherals::take().ok_or(())?;
-
-
-    // TODO: Probably don't need to do this at boot
-    let mut flash = if let Ok(ulf) = board.FLASH.unlock() {
-        // defmt::info!("unlocked.");
-        ulf
-    } else {
-        // defmt::error!("Unlock failed!");
-        sprocket_boot::exit()
-    };
-
-    // Read RAM settings
-    let mut stay_bootloader = false;
-    let mut force_bootloader = false;
-
-    stay_bootloader |= {
+    //
+    // Step 1: Check RAM Flags
+    //
+    {
         extern "C" {
             static _ram_flags: u8;
         }
+
+        //
+        // 1.1: Copy RAM command page to a local buffer, and clear them after
+        // a read.
+        //
 
         let mut buf = [0u8; 128];
 
         core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
-        let ram_flags_addr: *mut u8 = unsafe { &_ram_flags as *const _  as *mut _};
+        let ram_flags_addr: *mut u8 = unsafe { &_ram_flags as *const _ as *mut _ };
         let buffer_addr: *mut u8 = buf.as_mut_ptr();
         // defmt::info!("Loading ram page at {=u32:X}", ram_flags_addr as u32);
 
@@ -162,38 +139,73 @@ fn inner_main() -> Result<(), ()> {
 
         core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
+        //
+        // Step 1.2: Check magic word. If it is set, check the boot command flag
+        //
         if &0xCAFEB007u32.to_le_bytes() != &buf[..4] {
             // defmt::info!("No good RAM data.");
-            force_bootloader = true;
-            false
         } else {
             match buf[4] {
-                0x00 => true,
-                0x01 => false,
+                0x00 => {
+                    // A zero means STAY IN BOOTLOADER
+                    // defmt::info!("RAM: Stay in bootloader");
+                    decision = Some(BootDecision::ForceBootload);
+                }
+                0x01 => {
+                    // A one means BOOT TO APP
+                    // defmt::info!("RAM: Attempt boot");
+                    decision = Some(BootDecision::BootApp);
+                }
                 _ => {
-                    // defmt::error!("Bad command! Staying in bootloader!");
-                    force_bootloader = true;
-                    true
+                    // defmt::warn!("RAM: Invalid!");
+                    // Don't trust invalid variants. Keep the decision None.
+                    //
+                    // TODO: We could also treat this as "force bootloader"? Not
+                    // sure which is a better default
                 }
             }
         }
+    }
+
+    //
+    // Step 2 - Load Flash Settings Page
+    //
+
+    // NOTE: Here we take the peripherals, but we DON'T set up RCC, as it
+    // is unclear how to reset it without a reboot.
+    //
+    // TODO: We should probably be restoring/disabling anything we use here.
+    let board = stm32::Peripherals::take().ok_or(())?;
+    let mut core = stm32::CorePeripherals::take().ok_or(())?;
+
+    //
+    // Step 2.1 - Unlock Flash access
+    //
+
+    // TODO: We can probably just do volatile reads without using the flash
+    // peripheral at all.
+    let mut flash = if let Ok(ulf) = board.FLASH.unlock() {
+        // defmt::info!("unlocked.");
+        ulf
+    } else {
+        // defmt::error!("Unlock failed!");
+
+        // Delay a little time so we don't reboot TOO fast
+        cortex_m::asm::delay(8_000_000);
+        sprocket_boot::exit()
     };
 
-    let settings_msp;
-    let settings_rsv;
-
-    stay_bootloader |= {
-        // Read Settings page
+    //
+    // Step 2.2 - Load Flash Settings Page
+    //
+    let settings_msp_rsv: Option<(u32, u32)> = {
         extern "C" {
             static _settings_start: u32;
-            static _app_start: u32;
         }
 
         let settings_start = unsafe { &_settings_start as *const _ as usize };
-        let app_start = unsafe { &_app_start as *const _ as usize };
 
         let mut settings_bytes = [0u8; 12];
-        let mut app_bytes = [0u8; 8];
 
         flash.read(settings_start, &mut settings_bytes);
         let (magic_bytes_sl, remainder) = settings_bytes.split_at(4);
@@ -208,10 +220,35 @@ fn inner_main() -> Result<(), ()> {
         rsv_bytes.copy_from_slice(rsv_bytes_sl);
 
         let magic = u32::from_le_bytes(magic_bytes);
-        settings_msp = u32::from_le_bytes(msp_bytes);
-        settings_rsv = u32::from_le_bytes(rsv_bytes);
+        let settings_msp = u32::from_le_bytes(msp_bytes);
+        let settings_rsv = u32::from_le_bytes(rsv_bytes);
 
-        // ---
+        let good_magic = magic == 0xB007CAFEu32;
+        let good_msp = settings_msp != 0xFFFFFFFFu32;
+        let good_rsv = settings_rsv != 0xFFFFFFFFu32;
+
+        if good_magic && good_msp && good_rsv {
+            // defmt::info!("Good Settings data");
+            Some((settings_msp, settings_rsv))
+        } else {
+            // defmt::warn!("Bad Settings data");
+            decision = Some(BootDecision::ForceBootload);
+            None
+        }
+    };
+
+    //
+    // Step 2.2 - Load App Vector Table
+    //
+    let app_msp_rsv: (u32, u32) = {
+        // Read App Vector Table
+        extern "C" {
+            static _app_start: u32;
+        }
+
+        let app_start = unsafe { &_app_start as *const _ as usize };
+
+        let mut app_bytes = [0u8; 8];
 
         flash.read(app_start, &mut app_bytes);
         let (app_msp_bytes_sl, app_rsv_bytes_sl) = app_bytes.split_at(4);
@@ -225,157 +262,120 @@ fn inner_main() -> Result<(), ()> {
         let app_msp = u32::from_le_bytes(app_msp_bytes);
         let app_rsv = u32::from_le_bytes(app_rsv_bytes);
 
-        if magic != 0xB007CAFEu32 {
-            // defmt::info!("Bad settings magic!");
-            // Bad magic, keep in bootloader
-            true
-        } else {
-            extern "C" {
-                static PreResetTrampoline: u32;
-                static _stack_start: u32;
-            }
-
-            let boot_rsv = unsafe { &PreResetTrampoline as *const _ as u32 };
-            let boot_msp = unsafe { &_stack_start as *const _ as u32 };
-
-            // defmt::info!("app_msp: {=u32:X}", app_msp);
-            // defmt::info!("app_rsv: {=u32:X}", app_rsv);
-
-            // defmt::info!("boot_msp: {=u32:X}", boot_msp);
-            // defmt::info!("boot_rsv: {=u32:X}", boot_rsv);
-
-            // defmt::info!("settings_msp: {=u32:X}", settings_msp);
-            // defmt::info!("settings_rsv: {=u32:X}", settings_rsv);
-
-            !(
-                // the APP MSP and RSV should actually point to the bootloader
-                app_msp == boot_msp &&
-                app_rsv == boot_rsv &&
-
-                // Basic check on the MSP and RSV from settings (shouldn't be necessary)
-                settings_msp != 0xFFFFFFFF &&
-                settings_rsv != 0xFFFFFFFF
-            )
-        }
+        (app_msp, app_rsv)
     };
 
-    if !stay_bootloader && !force_bootloader {
-        defmt::info!("bootloading!");
-        defmt::info!("MSP: {=u32:X}", settings_msp);
-        defmt::info!("RSV: {=u32:X}", settings_rsv);
-
-        unsafe {
-            // for _ in 0..4 {
-            //     led1.set_high().ok();
-            //     led2.set_low().ok();
-
-            //     cortex_m::asm::delay(64_000_000 / 8);
-
-            //     led1.set_low().ok();
-            //     led2.set_high().ok();
-
-            //     cortex_m::asm::delay(64_000_000 / 8);
-            // }
-            cortex_m::asm::bootstrap(settings_msp as *const u32, settings_rsv as *const u32);
+    //
+    // Step 2.3 - Load Bootloader (our own) link time position information
+    //
+    let boot_msp_rsv: (u32, u32) = {
+        extern "C" {
+            // TODO: This goes away to Reset in newer version of `cortex-m`
+            static PreResetTrampoline: u32;
+            static _stack_start: u32;
         }
+
+        let boot_rsv = unsafe { &PreResetTrampoline as *const _ as u32 };
+        let boot_msp = unsafe { &_stack_start as *const _ as u32 };
+
+        (boot_msp, boot_rsv)
+    };
+
+    //
+    // Step 2.4 - Cross check for early boot
+    //
+    if let Some((stg_msp, stg_rsv)) = settings_msp_rsv {
+        if let Some(BootDecision::BootApp) = decision {
+            //
+            // Step 2.5 - We have intent to boot. Final checks and bootload
+            //
+            let good_app_msp = app_msp_rsv.0 == boot_msp_rsv.0;
+            let good_app_rsv = app_msp_rsv.1 == boot_msp_rsv.1;
+            let good_stg_msp = stg_msp != 0xFFFFFFFF;
+            let good_stg_rsv = stg_rsv != 0xFFFFFFFF;
+
+            if good_app_msp && good_app_rsv && good_stg_msp && good_stg_rsv {
+                // defmt::info!("bootloading!");
+                // defmt::info!("MSP: {=u32:X}", stg_msp);
+                // defmt::info!("RSV: {=u32:X}", stg_rsv);
+
+                unsafe {
+                    cortex_m::asm::bootstrap(
+                        stg_msp as *const u32,
+                        stg_rsv as *const u32
+                    );
+                }
+            } else {
+                // defmt::info!("Cross Check of values failed. Bootloading.");
+                decision = Some(BootDecision::ForceBootload);
+            }
+        }
+    } else {
+        // defmt::info!("Bad Settings. Bootloading.");
+        decision = Some(BootDecision::ForceBootload);
     }
 
-    cortex_m::interrupt::disable();
-
+    //
+    // Step 3.0 - Power on PLL clocks
+    //
     let config = Config::pll()
         .pll_cfg(PllConfig::with_hsi(1, 8, 2))
         .ahb_psc(Prescaler::NotDivided)
         .apb_psc(Prescaler::NotDivided);
     let mut rcc = board.RCC.freeze(config);
 
-
-    let gpioa = board.GPIOA.split(&mut rcc);
-    let gpiob = board.GPIOB.split(&mut rcc);
     let gpioc = board.GPIOC.split(&mut rcc);
-
-    let mut timer1 = board.TIM1.pwm(4096.hz(), &mut rcc);
-    let mut timer16 = board.TIM16.pwm(4096.hz(), &mut rcc);
-
-    let _gpio1 = gpioa.pa1;
-    let _uart_tx = gpioa.pa2;
-    let _uart_rx = gpioa.pa3;
-    let smartled = gpioa.pa4;
-    let _gpio2 = gpioa.pa5;
-    let _gpio3 = gpioa.pa6;
-    let _gpio4 = gpioa.pa7;
-    let _gpio7 = gpioa.pa8;
-    // let i2c2_scl = gpioa.pa9; // note: shadows pa11
-    // let i2c2_sda = gpioa.pa10; // note: shadows pa12
-    let i2c2_scl = gpioa.pa11; // note: shadows pa11
-    let i2c2_sda = gpioa.pa12; // note: shadows pa12
-    // let _ = gpioa.pa11; // see above
-    // let _ = gpioa.pa12; // see above
-    let _swdio = gpioa.pa13;
-    let _swclk = gpioa.pa14; // also boot0
-    let _spi_csn = gpioa.pa15;
-
-    let _gpio5 = gpiob.pb0;
-    let _gpio6 = gpiob.pb1;
-    let _spi_sck = gpiob.pb3;
-    let _spi_cipo = gpiob.pb4;
-    let _spi_copi = gpiob.pb5;
-    let _i2c1_scl = gpiob.pb6;
-    let _i2c1_sda = gpiob.pb7;
-    let mut led1 = gpioa.pa0.into_push_pull_output();
-    let mut led2 = gpiob.pb8.into_push_pull_output();
-    // Other pins not on this chip: PB2, PB9-15
-
-    let _gpio8 = gpioc.pc6;
     let button1 = gpioc.pc14.into_floating_input();
     let button2 = gpioc.pc15.into_floating_input();
-    // Other pins not on this chip: PC0-5, PC7-13
 
-    // No gpiod or gpioe
-    // gpiof: only PF2 is available as nRST, not used
-
-    let mut duty: u16 = 0;
-    let mut is_pwm_on = false;
-    let mut last_b1 = false;
-    let mut last_b2 = false;
-
-    // Are both buttons held?
-    if !force_bootloader {
+    //
+    // Step 3.1 - Check buttons if we aren't sure about what to do yet
+    //
+    if decision.is_none() {
+        // defmt::info!("Decision unclear, checking buttons.");
+        // Are both buttons held, signaling "stay in bootloader"?
         let buttons_held = (Ok(true), Ok(true)) == (button1.is_low(), button2.is_low());
 
         extern "C" {
             static _ram_flags: u8;
         }
 
-        let ram_flags_addr: *mut u8 = unsafe { &_ram_flags as *const _  as *mut _};
+        let ram_flags_addr: *mut u8 = unsafe { &_ram_flags as *const _ as *mut _ };
 
-
-        if buttons_held {
-
+        // Nope!
+        if !buttons_held {
+            // defmt::info!("No buttons, reboot with commanded boot to app");
             unsafe {
                 // HACK: reboot to clear PLLs if buttons are pressed
                 ram_flags_addr.cast::<u32>().write(0xCAFEB007);
-                ram_flags_addr.add(4).write(0x00);
-                SCB::sys_reset()
-            }
-        } else {
-            unsafe {
-                // HACK: reboot to clear PLLs if buttons are pressed
-                ram_flags_addr.cast::<u32>().write(0xCAFEB007);
+
+                // force boot to app
                 ram_flags_addr.add(4).write(0x01);
                 SCB::sys_reset()
             }
+        } else {
+            // defmt::info!("Buttons pressed. Bootloading.");
         }
     }
 
-    let mut i2c = I2CPeripheral::new(
-        board.I2C2,
-        i2c2_sda,
-        i2c2_scl,
-        &mut rcc,
-    );
+    //
+    // Step 4.0 - Start bootloader. At this point we are unsure, or know we
+    // must be bootloading, either way, let's bootload.
+    //
+    let gpioa = board.GPIOA.split(&mut rcc);
+    let gpiob = board.GPIOB.split(&mut rcc);
+
+    let smartled = gpioa.pa4;
+    let i2c2_scl = gpioa.pa11; // note: shadows pa9
+    let i2c2_sda = gpioa.pa12; // note: shadows pa10
+    let mut led1 = gpioa.pa0.into_push_pull_output();
+    let mut led2 = gpiob.pb8.into_push_pull_output();
+
+    let mut i2c = I2CPeripheral::new(board.I2C2, i2c2_sda, i2c2_scl, &mut rcc);
 
     GlobalRollingTimer::init(board.TIM2);
     let ght = GlobalRollingTimer::new();
+
     let mut start = ght.get_ticks();
     let mut ct = 0;
 
@@ -383,11 +383,10 @@ fn inner_main() -> Result<(), ()> {
 
     let mut boot = BootMachine::new(i2c, flash, led1, led2);
 
-    while let Ok(_) = boot.poll() {
+    while let Ok(_) = boot.poll() {}
 
-    }
-
-    loop {
+    // Oh no, something has gone wrong.
+    for _ in 0..10 {
         boot.led1.set_high().ok();
         boot.led2.set_low().ok();
 
@@ -398,6 +397,8 @@ fn inner_main() -> Result<(), ()> {
 
         cortex_m::asm::delay(64_000_000 / 4);
     }
+
+    Err(())
 }
 
 #[cortex_m_rt::entry]
@@ -431,28 +432,14 @@ struct BootMachine {
 #[derive(Debug, Eq, PartialEq)]
 enum BootLoadAction {
     Idle,
-    EraseThenWrite {
-        page: usize,
-        subpage: u8,
-    },
-    Writing {
-        page: usize,
-        subpage: u8,
-    }
+    EraseThenWrite { page: usize, subpage: u8 },
+    Writing { page: usize, subpage: u8 },
 }
 
 enum Transfer {
     Idle,
-    Writing {
-        addr: u8,
-        len: usize,
-        idx: usize,
-    },
-    Reading {
-        addr: u8,
-        len: usize,
-        idx: usize,
-    },
+    Writing { addr: u8, len: usize, idx: usize },
+    Reading { addr: u8, len: usize, idx: usize },
     Invalid,
 }
 
@@ -462,10 +449,10 @@ enum TransferDir {
     Write,
 }
 
-type QueueFunc<T> = fn(&mut BootMachine) -> Result<T, ()>;
+type QueueFunc = fn(&mut BootMachine) -> Result<bool, ()>;
 
 #[derive(Clone)]
-struct StateQueueItem(QueueFunc<bool>);
+struct StateQueueItem(QueueFunc);
 
 impl Default for StateQueueItem {
     fn default() -> Self {
@@ -506,7 +493,7 @@ impl StateQueue {
                 StateQueueItem::default(),
                 StateQueueItem::default(),
                 StateQueueItem::default(),
-            ]
+            ],
         }
     }
 
@@ -550,7 +537,12 @@ impl StateQueue {
 }
 
 impl BootMachine {
-    fn new(i2c: I2CPeripheral, flash: UnlockedFlash, led1: PA0<Output<PushPull>>, led2: PB8<Output<PushPull>>) -> Self {
+    fn new(
+        i2c: I2CPeripheral,
+        flash: UnlockedFlash,
+        led1: PA0<Output<PushPull>>,
+        led2: PB8<Output<PushPull>>,
+    ) -> Self {
         Self {
             i2c,
             flash,
@@ -631,11 +623,9 @@ impl BootMachine {
             panic!("Bounds checking failure")
         }
 
-        i2cpac.txdr.modify(|_, w| {
-            unsafe {
-                w.txdata().bits(self.buffer[idx])
-            }
-        });
+        i2cpac
+            .txdr
+            .modify(|_, w| unsafe { w.txdata().bits(self.buffer[idx]) });
         idx += 1;
 
         if idx == len {
@@ -655,11 +645,7 @@ impl BootMachine {
         if isr.txis().bit_is_set() {
             self.nak();
             // defmt::error!("asked for more read when stop expected!");
-            i2cpac.txdr.modify(|_, w| {
-                unsafe {
-                    w.txdata().bits(0)
-                }
-            });
+            i2cpac.txdr.modify(|_, w| unsafe { w.txdata().bits(0) });
         }
 
         // Is the controller giving us more data still?
@@ -671,9 +657,7 @@ impl BootMachine {
 
         // Is the controller finally done?
         if i2cpac.isr.read().stopf().bit_is_set() {
-            i2cpac.icr.write(|w| {
-                w.stopcf().set_bit()
-            });
+            i2cpac.icr.write(|w| w.stopcf().set_bit());
             // defmt::info!("got stop.");
             Ok(true)
         } else {
@@ -740,7 +724,7 @@ impl BootMachine {
             (page, subpage)
         } else {
             // defmt::error!("Tried to erase when not prepared!");
-            return Err(())
+            return Err(());
         };
 
         // defmt::info!("erasing page {=u32}...", page as u32);
@@ -760,7 +744,7 @@ impl BootMachine {
                 return Err(());
             }
         } else {
-            defmt::warn!("Skipped actual erase! Pretend it's good.");
+            // defmt::warn!("Skipped actual erase! Pretend it's good.");
         }
 
         // Erase good! Move on to write. We unconditionally write after an erase
@@ -777,7 +761,7 @@ impl BootMachine {
             (page, subpage)
         } else {
             // defmt::error!("Tried to write when not prepared!");
-            return Err(())
+            return Err(());
         };
 
         let subpage_image = &self.buffer[1..257];
@@ -794,8 +778,8 @@ impl BootMachine {
         let app_start = unsafe { &_app_start as *const _ as usize };
 
         // NOTE: app_start is already offset to the base of the temporary flash region
-        let store_addr = (app_start + (page * flash::PAGE_SIZE as usize))
-            + (subpage as usize * 256);
+        let store_addr =
+            (app_start + (page * flash::PAGE_SIZE as usize)) + (subpage as usize * 256);
 
         // defmt::info!("Writing subpage at {=u32:X}...", store_addr as u32);
 
@@ -804,8 +788,8 @@ impl BootMachine {
                 // defmt::error!("Write failed!");
             })?;
         } else {
-            defmt::warn!("Skipped actual write! Pretend it's good.");
-            defmt::info!("page: {:?}", subpage_image);
+            // defmt::warn!("Skipped actual write! Pretend it's good.");
+            // defmt::info!("page: {:?}", subpage_image);
         }
 
         Ok(true)
@@ -906,7 +890,6 @@ impl BootMachine {
             self.buffer[5..9].copy_from_slice(&reset_vector.to_le_bytes());
         }
 
-
         let map = self.map.get_page_mut(page).ok_or(())?;
 
         if *map == 0 {
@@ -923,10 +906,7 @@ impl BootMachine {
                 StateQueueItem(BootMachine::match_write_register),
             ]);
 
-            self.flash_action = BootLoadAction::EraseThenWrite {
-                page,
-                subpage,
-            };
+            self.flash_action = BootLoadAction::EraseThenWrite { page, subpage };
             Ok(true)
         } else if (*map & 1 << subpage) == 0 {
             // defmt::info!("Subpage accepted. Flash started");
@@ -941,10 +921,7 @@ impl BootMachine {
                 StateQueueItem(BootMachine::match_write_register),
             ]);
 
-            self.flash_action = BootLoadAction::Writing {
-                page,
-                subpage,
-            };
+            self.flash_action = BootLoadAction::Writing { page, subpage };
             Ok(true)
         } else {
             // defmt::error!("Can't re-write pages!");
@@ -957,7 +934,7 @@ impl BootMachine {
             len
         } else {
             // defmt::error!("Wrong state!");
-            return Err(())
+            return Err(());
         };
 
         if len != 5 {
@@ -978,7 +955,7 @@ impl BootMachine {
 
         if subpages % (SUBPAGES_PER_PAGE as u8) != 0 {
             // defmt::error!("Must provide whole page!");
-            return Err(())
+            return Err(());
         }
 
         let pages = (subpages >> 3) as usize;
@@ -1059,9 +1036,11 @@ impl BootMachine {
         }
 
         if !SKIP_FLASH {
-            self.flash.write(settings_start, &self.buffer[..256]).map_err(|_| {
-                // defmt::error!("Write failed!");
-            })?;
+            self.flash
+                .write(settings_start, &self.buffer[..256])
+                .map_err(|_| {
+                    // defmt::error!("Write failed!");
+                })?;
         } else {
             // defmt::warn!("Skipped actual settings write! Pretend it's good.");
         }
@@ -1073,16 +1052,17 @@ impl BootMachine {
         if !SKIP_FLASH {
             // TODO: Re-lock flash?
             // TODO: Clear RAM flags?
-            for _ in 0..3 {
-                self.led1.set_high().ok();
+            // TODO: Clear interrupts?
+            for _ in 0..8 {
+                self.led1.set_low().ok();
                 self.led2.set_high().ok();
 
-                cortex_m::asm::delay(64_000_000);
+                cortex_m::asm::delay(64_000_000 / 16);
 
-                self.led1.set_low().ok();
+                self.led1.set_high().ok();
                 self.led2.set_low().ok();
 
-                cortex_m::asm::delay(64_000_000);
+                cortex_m::asm::delay(64_000_000 / 16);
             }
 
             SCB::sys_reset()
@@ -1169,7 +1149,6 @@ impl BootMachine {
             //     * 0x44 - Offer image downstream
             //         * Only after finishing 0x40 transaction
 
-
             // * Read transactions
             //     * wr-then-rd 0x10 + 16 bytes => b'sprocket boot!!!'
             0x10 => {
@@ -1227,7 +1206,6 @@ impl BootMachine {
             TransferDir::Write
         };
 
-
         // Is this in the direction we expected?
         if dir != direction {
             self.nak();
@@ -1236,15 +1214,11 @@ impl BootMachine {
             false
         } else {
             // Clear a NAK
-            i2cpac.cr2.write(|w| {
-                w.nack().clear_bit()
-            });
+            i2cpac.cr2.write(|w| w.nack().clear_bit());
 
             // defmt::info!("Acked a correct address+direction");
             if direction == TransferDir::Read {
-                i2cpac.isr.write(|w| {
-                    w.txe().set_bit()
-                });
+                i2cpac.isr.write(|w| w.txe().set_bit());
             }
             self.ack_addr_match();
             true
@@ -1255,18 +1229,14 @@ impl BootMachine {
         let i2cpac = self.i2c.borrow_pac();
 
         // Clear the ADDR match flag
-        i2cpac.icr.write(|w| {
-            w.addrcf().set_bit()
-        });
+        i2cpac.icr.write(|w| w.addrcf().set_bit());
     }
 
     fn nak(&self) {
         let i2cpac = self.i2c.borrow_pac();
 
         // Command a NAK
-        i2cpac.cr2.write(|w| {
-            w.nack().set_bit()
-        });
+        i2cpac.cr2.write(|w| w.nack().set_bit());
     }
 
     fn get_written_byte(&self) -> Option<u8> {
