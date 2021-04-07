@@ -23,6 +23,11 @@ use sprocket_boot::{
     self as _, // global logger + panicking-behavior + memory layout
     sprkt_log,
     boot_machine::BootMachine,
+    consts::{
+        BootCommand,
+        FLASH_MAGIC_WORD,
+        RAM_MAGIC_WORD,
+    },
 };
 
 use stm32g0xx_hal::i2c_periph::I2CPeripheral;
@@ -32,8 +37,6 @@ use stm32g0xx_hal::{
     rcc::{Config, PllConfig, Prescaler},
     stm32,
 };
-
-
 
 enum BootDecision {
     ForceBootload,
@@ -80,16 +83,15 @@ fn inner_main() -> Result<(), ()> {
         //
         // Step 1.2: Check magic word. If it is set, check the boot command flag
         //
-        if &0xCAFEB007u32.to_le_bytes() != &buf[..4] {
+        if &RAM_MAGIC_WORD.to_le_bytes() != &buf[..4] {
             sprkt_log!(info, "No good RAM data.");
         } else {
-            match buf[4] {
-                0x00 => {
-                    // A zero means STAY IN BOOTLOADER
+            match buf[4].into() {
+                BootCommand::StayInBootloader => {
                     sprkt_log!(info, "RAM: Stay in bootloader");
                     decision = Some(BootDecision::ForceBootload);
                 }
-                0x01 => {
+                BootCommand::LoadApp => {
                     // A one means BOOT TO APP
                     sprkt_log!(info, "RAM: Attempt boot");
                     decision = Some(BootDecision::BootApp);
@@ -160,7 +162,7 @@ fn inner_main() -> Result<(), ()> {
         let settings_msp = u32::from_le_bytes(msp_bytes);
         let settings_rsv = u32::from_le_bytes(rsv_bytes);
 
-        let good_magic = magic == 0xB007CAFEu32;
+        let good_magic = magic == FLASH_MAGIC_WORD;
         let good_msp = settings_msp != 0xFFFFFFFFu32;
         let good_rsv = settings_rsv != 0xFFFFFFFFu32;
 
@@ -253,7 +255,7 @@ fn inner_main() -> Result<(), ()> {
     }
 
     //
-    // Step 3.0 - Power on PLL clocks
+    // Step 3.0 - Power on PLL clocks- Full 64MHz
     //
     let config = Config::pll()
         .pll_cfg(PllConfig::with_hsi(1, 8, 2))
@@ -284,10 +286,10 @@ fn inner_main() -> Result<(), ()> {
             sprkt_log!(info, "No buttons, reboot with commanded boot to app");
             unsafe {
                 // HACK: reboot to clear PLLs if buttons are pressed
-                ram_flags_addr.cast::<u32>().write(0xCAFEB007);
+                ram_flags_addr.cast::<u32>().write(RAM_MAGIC_WORD);
 
                 // force boot to app
-                ram_flags_addr.add(4).write(0x01);
+                ram_flags_addr.add(4).write(BootCommand::LoadApp as u8);
                 SCB::sys_reset()
             }
         } else {
@@ -313,11 +315,14 @@ fn inner_main() -> Result<(), ()> {
 
     sprkt_log!(info, "Launching bootloader!");
 
+    //
+    // Step 5 - Hand control over to BootMachine for sequencing of tasks
+    //
     let mut boot = BootMachine::new(i2c, flash, led1, led2);
-
     while let Ok(_) = boot.poll() {}
 
     // Oh no, something has gone wrong.
+    sprkt_log!(error, "Something has gone awry");
     for _ in 0..10 {
         boot.led1.set_high().ok();
         boot.led2.set_low().ok();

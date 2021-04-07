@@ -1,4 +1,4 @@
-use crate::TOTAL_PAGES;
+use crate::consts::TOTAL_PAGES;
 
 pub struct PageMap {
     pub pages: [u8; TOTAL_PAGES],

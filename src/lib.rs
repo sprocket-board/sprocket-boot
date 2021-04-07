@@ -34,15 +34,6 @@ mod defmt {
 #[cfg(feature = "panic-reset")]
 use panic_reset as _;
 
-const SKIP_FLASH: bool = cfg!(feature = "skip-flash");
-const TOTAL_PAGES: usize = 24;
-
-// TODO: You REALLY can't change this, because I am bit-packing
-const SUBPAGES_PER_PAGE: usize = 8;
-
-const TOTAL_SUBPAGES: usize = TOTAL_PAGES * SUBPAGES_PER_PAGE;
-
-
 /// Terminates the application and makes `probe-run` exit with exit-code = 0
 pub fn exit() -> ! {
     loop {

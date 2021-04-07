@@ -2,10 +2,13 @@ use cortex_m::peripheral::SCB;
 use crate::{
     self as _, // global logger + panicking-behavior + memory layout
     exit as yeet,
-    SKIP_FLASH,
-    SUBPAGES_PER_PAGE,
-    TOTAL_SUBPAGES,
-    TOTAL_PAGES,
+    consts::{
+        SKIP_FLASH,
+        SUBPAGES_PER_PAGE,
+        TOTAL_SUBPAGES,
+        TOTAL_PAGES,
+        FLASH_MAGIC_WORD,
+    },
     page_map::PageMap,
     generate_checksum,
 };
@@ -116,7 +119,7 @@ impl StateQueue {
     }
 
     fn push(&mut self, item: StateQueueItem) -> Result<(), ()> {
-        if self.idx == ITEMS {
+        if self.idx >= self.items.len() {
             sprkt_log!(error, "Push fail!");
             return Err(());
         }
@@ -127,6 +130,8 @@ impl StateQueue {
     }
 }
 
+// This is the main interface for bootmachine. You basically create it
+// and poll it until it produces an error.
 impl BootMachine {
     pub fn new(
         i2c: I2CPeripheral,
@@ -156,6 +161,39 @@ impl BootMachine {
         }
     }
 
+    pub fn poll(&mut self) -> Result<(), ()> {
+        match self.poll_inner() {
+            Ok(()) => Ok(()),
+            Err(()) => {
+                todo!("clear the queue, go into some kind of recovery?");
+            }
+        }
+    }
+
+    fn poll_inner(&mut self) -> Result<(), ()> {
+        let action = self.sq.pop().ok_or(())?;
+
+        if !(action.0)(self)? {
+            let x = self.sq.push(action);
+            if x.is_err() {
+                sprkt_log!(error, "Queue is full???");
+            }
+
+            x?;
+        }
+
+        Ok(())
+    }
+}
+
+// These are the scripted actions that can be used as building blocks
+// for the bootmachine. They all have the same signature, which means:
+//
+// Ok(true)  - Task is complete, move on to the next
+// Ok(false) - Task is still working, continue to call
+// Err(_)    - Task has failed. For now, abort. In the future,
+//   we might provide a recovery script instead
+impl BootMachine {
     fn complete_write(&mut self) -> Result<bool, ()> {
         let (addr, mut idx, len) = if let Transfer::Writing { addr, len, idx } = &self.transfer {
             (*addr, *idx, *len)
@@ -164,9 +202,7 @@ impl BootMachine {
             return Err(());
         };
 
-        if idx >= len {
-            panic!("Why are you writing more")
-        }
+        assert!(len < idx, "Why are you writing more");
 
         let i2cpac = self.i2c.borrow_pac();
 
@@ -277,30 +313,6 @@ impl BootMachine {
             Ok(true)
         } else {
             Ok(false)
-        }
-    }
-
-    fn poll_inner(&mut self) -> Result<(), ()> {
-        let action = self.sq.pop().ok_or(())?;
-
-        if !(action.0)(self)? {
-            let x = self.sq.push(action);
-            if x.is_err() {
-                sprkt_log!(error, "Queue is full???");
-            }
-
-            x?;
-        }
-
-        Ok(())
-    }
-
-    pub fn poll(&mut self) -> Result<(), ()> {
-        match self.poll_inner() {
-            Ok(()) => Ok(()),
-            Err(()) => {
-                todo!("clear the queue, go into some kind of recovery?");
-            }
         }
     }
 
@@ -434,8 +446,8 @@ impl BootMachine {
         let page = (ps >> 3) as usize;
         let subpage = ps & 0b111;
 
-        // assert!(page < TOTAL_PAGES);
-        // assert!((subpage as usize) < SUBPAGES_PER_PAGE);
+        assert!(page < TOTAL_PAGES);
+        assert!((subpage as usize) < SUBPAGES_PER_PAGE);
 
         let mut checksum_unchecked_bytes = [0u8; 4];
         checksum_unchecked_bytes.copy_from_slice(&self.buffer[257..261]);
@@ -587,7 +599,7 @@ impl BootMachine {
         sprkt_log!(info, "App MSP: {=usize:X}", self.map.msp);
         sprkt_log!(info, "App RsV: {=usize:X}", self.map.reset_vector);
 
-        self.buffer[..4].copy_from_slice(&0xB007CAFEu32.to_le_bytes());
+        self.buffer[..4].copy_from_slice(&FLASH_MAGIC_WORD.to_le_bytes());
         self.buffer[4..8].copy_from_slice(&self.map.msp.to_le_bytes());
         self.buffer[8..12].copy_from_slice(&self.map.reset_vector.to_le_bytes());
 
