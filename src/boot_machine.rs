@@ -13,7 +13,10 @@ use crate::{
     generate_checksum,
 };
 
-use stm32g0xx_hal::i2c_periph::I2CPeripheral;
+use stm32g0xx_hal::i2c_periph::{
+    I2CPeripheral,
+    Instance
+};
 use stm32g0xx_hal::{
     flash::{self, FlashPage, Read, UnlockedFlash, WriteErase, Error as FlashError},
     gpio::{
@@ -24,16 +27,18 @@ use stm32g0xx_hal::{
     prelude::*,
 };
 
-pub struct BootMachine {
-    i2c: I2CPeripheral,
+pub struct BootMachine<P: Instance> {
+    i2c: I2CPeripheral<P>,
+    current_i2c_addr: u8,
     transfer: Transfer,
     buffer: [u8; 512],
     flash: UnlockedFlash,
     map: PageMap,
-    sq: StateQueue,
+    sq: StateQueue<Self>,
     flash_action: BootLoadAction,
     pub led1: PA0<Output<PushPull>>,
     pub led2: PB8<Output<PushPull>>,
+    new_i2c_addr: Option<u8>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -55,30 +60,35 @@ enum TransferDir {
     Write,
 }
 
-type QueueFunc = fn(&mut BootMachine) -> Result<bool, ()>;
+type QueueFunc<T> = fn(&mut T) -> Result<bool, ()>;
 
-#[derive(Clone)]
-struct StateQueueItem(QueueFunc);
+struct StateQueueItem<T>(QueueFunc<T>);
 
-impl Default for StateQueueItem {
+impl<T> Clone for StateQueueItem<T> {
+    fn clone(&self) -> Self {
+        StateQueueItem(self.0)
+    }
+}
+
+impl<T> Default for StateQueueItem<T> {
     fn default() -> Self {
         Self(nop_state_err)
     }
 }
 
-fn nop_state_err<T>(_: &mut BootMachine) -> Result<T, ()> {
+fn nop_state_err<T, R>(_: &mut T) -> Result<R, ()> {
     sprkt_log!(error, "Nop state error!");
     Err(())
 }
 
 const ITEMS: usize = 8;
 
-struct StateQueue {
-    items: [StateQueueItem; ITEMS],
+struct StateQueue<T> {
+    items: [StateQueueItem<T>; ITEMS],
     idx: usize,
 }
 
-impl StateQueue {
+impl<T> StateQueue<T> {
     fn new() -> Self {
         Self {
             idx: 0,
@@ -95,19 +105,19 @@ impl StateQueue {
         }
     }
 
-    fn from_slice(items: &[StateQueueItem]) -> Self {
+    fn from_slice(items: &[StateQueueItem<T>]) -> Self {
         // assert!(items.len() <= 8, "Increase Queue Size!");
 
         let mut new = Self::new();
         new.idx = 0;
         items.iter().rev().take(ITEMS).for_each(|i| {
-            new.items[new.idx] = i.clone();
+            new.items[new.idx] = (*i).clone();
             new.idx += 1;
         });
         new
     }
 
-    fn pop(&mut self) -> Option<StateQueueItem> {
+    fn pop(&mut self) -> Option<StateQueueItem<T>> {
         if self.idx == 0 {
             None
         } else {
@@ -118,7 +128,7 @@ impl StateQueue {
         }
     }
 
-    fn push(&mut self, item: StateQueueItem) -> Result<(), ()> {
+    fn push(&mut self, item: StateQueueItem<T>) -> Result<(), ()> {
         if self.idx >= self.items.len() {
             sprkt_log!(error, "Push fail!");
             return Err(());
@@ -132,12 +142,13 @@ impl StateQueue {
 
 // This is the main interface for bootmachine. You basically create it
 // and poll it until it produces an error.
-impl BootMachine {
+impl<P: Instance> BootMachine<P> {
     pub fn new(
-        i2c: I2CPeripheral,
+        i2c: I2CPeripheral<P>,
         flash: UnlockedFlash,
         led1: PA0<Output<PushPull>>,
         led2: PB8<Output<PushPull>>,
+        addr: u8,
     ) -> Self {
         Self {
             i2c,
@@ -158,6 +169,8 @@ impl BootMachine {
             flash_action: BootLoadAction::Idle,
             led1,
             led2,
+            new_i2c_addr: None,
+            current_i2c_addr: addr,
         }
     }
 
@@ -193,7 +206,7 @@ impl BootMachine {
 // Ok(false) - Task is still working, continue to call
 // Err(_)    - Task has failed. For now, abort. In the future,
 //   we might provide a recovery script instead
-impl BootMachine {
+impl<P: Instance> BootMachine<P> {
     fn complete_write(&mut self) -> Result<bool, ()> {
         let (addr, mut idx, len) = if let Transfer::Writing { addr, len, idx } = &self.transfer {
             (*addr, *idx, *len)
@@ -202,7 +215,7 @@ impl BootMachine {
             return Err(());
         };
 
-        assert!(len < idx, "Why are you writing more");
+        assert!(idx < len, "Why are you writing more");
 
         let i2cpac = self.i2c.borrow_pac();
 
@@ -602,6 +615,12 @@ impl BootMachine {
         self.buffer[..4].copy_from_slice(&FLASH_MAGIC_WORD.to_le_bytes());
         self.buffer[4..8].copy_from_slice(&self.map.msp.to_le_bytes());
         self.buffer[8..12].copy_from_slice(&self.map.reset_vector.to_le_bytes());
+        if let Some(addr) = self.new_i2c_addr.take() {
+            sprkt_log!(info, "Updating i2c: from {=u8:X} to {=u8:X}", self.buffer[12], addr);
+            self.buffer[12] = addr;
+        } else {
+            self.buffer[12] = self.current_i2c_addr;
+        }
 
         // TODO: De-duplicate this with erase page and write page. Right now it's
         // hardcoded to the offset write section, instead of the total range.
@@ -663,7 +682,12 @@ impl BootMachine {
         }
     }
 
-    fn start_txfr(&mut self, addr: u8) -> StateQueue {
+    fn set_i2c(&mut self) -> Result<bool, ()> {
+        self.new_i2c_addr = Some(self.buffer[1]);
+        Ok(true)
+    }
+
+    fn start_txfr(&mut self, addr: u8) -> StateQueue<Self> {
         match addr {
             // * Write transactions:
 
@@ -740,6 +764,23 @@ impl BootMachine {
             //         * No data
             //     * 0x44 - Offer image downstream
             //         * Only after finishing 0x40 transaction
+            //     * 0x45 - new I2C address
+            //         * 1 byte - 7-bit i2c addr
+            0x45 => {
+                sprkt_log!(info, "Start I2C addr");
+                self.transfer = Transfer::Writing {
+                    addr,
+                    len: 1,
+                    idx: 0,
+                };
+                StateQueue::from_slice(&[
+                    StateQueueItem(BootMachine::complete_write),
+                    StateQueueItem(BootMachine::set_i2c),
+                    StateQueueItem(BootMachine::wait_for_stop),
+                    StateQueueItem(BootMachine::match_address_write),
+                    StateQueueItem(BootMachine::match_write_register),
+                ])
+            }
 
             // * Read transactions
             //     * wr-then-rd 0x10 + 16 bytes => b'sprocket boot!!!'
@@ -783,7 +824,7 @@ impl BootMachine {
             return false;
         }
 
-        if i2cpac.isr.read().addcode().bits() != 0x69 {
+        if i2cpac.isr.read().addcode().bits() != self.current_i2c_addr {
             self.nak();
             self.ack_addr_match();
             sprkt_log!(error, "Address Mismatch!");

@@ -137,6 +137,7 @@ fn inner_main() -> Result<(), ()> {
     //
     // Step 2.2 - Load Flash Settings Page
     //
+    let mut i2c_addr = 0x69;
     let settings_msp_rsv: Option<(u32, u32)> = {
         extern "C" {
             static _settings_start: u32;
@@ -144,11 +145,12 @@ fn inner_main() -> Result<(), ()> {
 
         let settings_start = unsafe { &_settings_start as *const _ as usize };
 
-        let mut settings_bytes = [0u8; 12];
+        let mut settings_bytes = [0u8; 13];
 
         flash.read(settings_start, &mut settings_bytes);
         let (magic_bytes_sl, remainder) = settings_bytes.split_at(4);
-        let (msp_bytes_sl, rsv_bytes_sl) = remainder.split_at(4);
+        let (msp_bytes_sl, remainder) = remainder.split_at(4);
+        let (rsv_bytes_sl, i2c_byte_sl) = remainder.split_at(4);
 
         let mut magic_bytes = [0u8; 4];
         let mut msp_bytes = [0u8; 4];
@@ -168,6 +170,7 @@ fn inner_main() -> Result<(), ()> {
 
         if good_magic && good_msp && good_rsv {
             sprkt_log!(info, "Good Settings data");
+            i2c_addr = i2c_byte_sl[0];
             Some((settings_msp, settings_rsv))
         } else {
             sprkt_log!(warn, "Bad Settings data");
@@ -304,21 +307,27 @@ fn inner_main() -> Result<(), ()> {
     let gpioa = board.GPIOA.split(&mut rcc);
     let gpiob = board.GPIOB.split(&mut rcc);
 
-    let i2c2_scl = gpioa.pa11; // note: shadows pa9
-    let i2c2_sda = gpioa.pa12; // note: shadows pa10
+    let i2c1_scl = gpiob.pb6; // note: shadows pa9
+    let i2c1_sda = gpiob.pb7; // note: shadows pa10
     let mut led1 = gpioa.pa0.into_push_pull_output();
     let mut led2 = gpiob.pb8.into_push_pull_output();
     led1.set_low().ok();
     led2.set_low().ok();
 
-    let i2c = I2CPeripheral::new(board.I2C2, i2c2_sda, i2c2_scl, &mut rcc);
+    let i2c = I2CPeripheral::new(
+        board.I2C1,
+        i2c1_sda,
+        i2c1_scl,
+        &mut rcc,
+        i2c_addr
+    );
 
     sprkt_log!(info, "Launching bootloader!");
 
     //
     // Step 5 - Hand control over to BootMachine for sequencing of tasks
     //
-    let mut boot = BootMachine::new(i2c, flash, led1, led2);
+    let mut boot = BootMachine::new(i2c, flash, led1, led2, i2c_addr);
     while let Ok(_) = boot.poll() {}
 
     // Oh no, something has gone wrong.

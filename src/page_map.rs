@@ -36,6 +36,17 @@ impl PageMap {
     }
 
     pub fn bootload_complete(&self) -> bool {
+        self.no_subpages_written() || self.all_subpages_written()
+    }
+
+    fn no_subpages_written(&self) -> bool {
+        self.pages
+            .iter()
+            .take(self.active_pages)
+            .all(|p| *p == 0x00)
+    }
+
+    fn all_subpages_written(&self) -> bool {
         self.unlocked
             && self.active_pages > 0
             && self

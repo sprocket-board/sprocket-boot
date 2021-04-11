@@ -1,3 +1,3 @@
 [submodule "vendor/stm32g0xx-hal"]
 	path = vendor/stm32g0xx-hal
-	url = https://github.com/jamesmunns/stm32g0xx-hal
+	url = https://github.com/sprocket-board/stm32g0xx-hal
