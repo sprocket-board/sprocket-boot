@@ -312,7 +312,7 @@ impl<P: Instance> BootMachine<P> {
     }
 
     fn match_address_read(&mut self) -> Result<bool, ()> {
-        // We always expect a write from idle (write or write-then-read)
+        // Expect a read match
         if self.check_addr_match(TransferDir::Read) {
             Ok(true)
         } else {
