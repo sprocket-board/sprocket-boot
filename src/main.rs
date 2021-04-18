@@ -333,7 +333,7 @@ fn inner_main() -> Result<(), ()> {
     // Step 5 - Hand control over to BootMachine for sequencing of tasks
     //
     let mut boot = BootMachine::new(i2c, flash, led1, led2, i2c_addr);
-    let x = boot.abort();
+    let x = boot.entry();
 
     pin_mut!(x);
 

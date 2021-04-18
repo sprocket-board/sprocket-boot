@@ -17,8 +17,9 @@ cortex-m-rt = "0.6.13"
 embedded-hal = "0.2.4"
 
 [dependencies.cassette]
-git = "https://github.com/jamesmunns/cassette"
-branch = "main"
+# git = "https://github.com/jamesmunns/cassette"
+# branch = "main"
+path = "/home/james/personal/cassette"
 
 [dependencies.panic-reset]
 version = "0.1"
