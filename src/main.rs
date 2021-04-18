@@ -38,6 +38,11 @@ use stm32g0xx_hal::{
     stm32,
 };
 
+use cassette::{
+    CasMachine,
+    pin_mut,
+};
+
 enum BootDecision {
     ForceBootload,
     BootApp,
@@ -328,21 +333,32 @@ fn inner_main() -> Result<(), ()> {
     // Step 5 - Hand control over to BootMachine for sequencing of tasks
     //
     let mut boot = BootMachine::new(i2c, flash, led1, led2, i2c_addr);
-    while let Ok(_) = boot.poll() {}
+    let x = boot.abort();
+
+    pin_mut!(x);
+
+    let mut machine = CasMachine::new(x);
+
+    loop {
+        if let Some(_) = machine.poll_on() {
+            sprkt_log!(warn, "Machine is done!");
+            break;
+        }
+    }
 
     // Oh no, something has gone wrong.
     sprkt_log!(error, "Something has gone awry");
-    for _ in 0..10 {
-        boot.led1.set_high().ok();
-        boot.led2.set_low().ok();
+    // for _ in 0..10 {
+    //     boot.led1.set_high().ok();
+    //     boot.led2.set_low().ok();
 
-        cortex_m::asm::delay(64_000_000 / 4);
+    //     cortex_m::asm::delay(64_000_000 / 4);
 
-        boot.led1.set_low().ok();
-        boot.led2.set_high().ok();
+    //     boot.led1.set_low().ok();
+    //     boot.led2.set_high().ok();
 
-        cortex_m::asm::delay(64_000_000 / 4);
-    }
+    //     cortex_m::asm::delay(64_000_000 / 4);
+    // }
 
     Err(())
 }

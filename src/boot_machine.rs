@@ -882,3 +882,11 @@ impl<P: Instance> BootMachine<P> {
         }
     }
 }
+
+
+// TODO AJM THIS IS A HACK
+impl<P: Instance> BootMachine<P> {
+    pub async fn abort(&mut self) {
+        panic!()
+    }
+}
