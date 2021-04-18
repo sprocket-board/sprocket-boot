@@ -78,7 +78,74 @@ impl<P: Instance> BootMachine<P> {
 // Err(_)    - Task has failed. For now, abort. In the future,
 //   we might provide a recovery script instead
 impl<P: Instance> BootMachine<P> {
-    fn enable_i2c(&mut self) -> Result<bool, ()> {
+
+    async fn match_write_register(&mut self) -> u8 {
+        self.i2c.get_written_byte().await
+    }
+
+
+    async fn erase_page(&mut self, page: usize) -> Result<(), ()> {
+        sprkt_log!(info, "erasing page {=usize}...", page);
+
+        if !SKIP_FLASH {
+            // TODO: This is totally blocking, but it's going to stall
+            // the bus anyway, so not much use in yielding
+            if let Err(e) = self.flash.erase_page(FlashPage(page)) {
+                sprkt_log!(error, "Erase failed:");
+
+                match e {
+                    FlashError::Busy => sprkt_log!(info, "busy."),
+                    FlashError::Illegal => sprkt_log!(info, "illegal."),
+                    FlashError::EccError => sprkt_log!(info, "ecc err."),
+                    FlashError::PageOutOfRange => sprkt_log!(info, "page oor."),
+                    FlashError::Failure => sprkt_log!(info, "failure."),
+                };
+
+                return Err(());
+            }
+        } else {
+            sprkt_log!(warn, "Skipped actual erase! Pretend it's good.");
+        }
+
+        Ok(())
+    }
+
+
+    async fn write_subpage(&mut self, page: usize, subpage: u8) -> Result<(), ()> {
+        let subpage_image = &self.buffer[..256];
+
+        if subpage_image.iter().all(|b| *b == 0xFF) {
+            sprkt_log!(info, "Page is all 0xFF, skipping write");
+            return Ok(());
+        }
+
+        extern "C" {
+            static _app_start: u32;
+        }
+
+        let app_start = unsafe { &_app_start as *const _ as usize };
+
+        // NOTE: app_start is already offset to the base of the temporary flash region
+        let store_addr =
+            (app_start + (page * flash::PAGE_SIZE as usize)) + (subpage as usize * 256);
+
+        sprkt_log!(info, "Writing subpage at {=u32:X}...", store_addr as u32);
+
+        if !SKIP_FLASH {
+            // TODO: This is totally blocking! But there's not much else to do here
+            // while we're waiting, since flash writes stall the bus entirely
+            self.flash.write(store_addr, subpage_image).map_err(|_| {
+                sprkt_log!(error, "Write failed!");
+            })?;
+        } else {
+            sprkt_log!(warn, "Skipped actual write! Pretend it's good.");
+            sprkt_log!(info, "page: {:?}", subpage_image);
+        }
+
+        Ok(())
+    }
+
+    fn enable_i2c(&mut self) -> Result<(), ()> {
         if self.i2c.is_enabled() {
             sprkt_log!(error, "Oops, expected to be disabled but we're not");
             return Err(());
@@ -86,10 +153,10 @@ impl<P: Instance> BootMachine<P> {
         unsafe {
             self.i2c.enable();
         }
-        Ok(true)
+        Ok(())
     }
 
-    fn disable_i2c(&mut self) -> Result<bool, ()> {
+    fn disable_i2c(&mut self) -> Result<(), ()> {
         if !self.i2c.is_enabled() {
             sprkt_log!(error, "Oops, expected to be enabled but we're not");
             return Err(());
@@ -97,9 +164,150 @@ impl<P: Instance> BootMachine<P> {
         unsafe {
             self.i2c.disable();
         }
+        Ok(())
+    }
 
-        // TODO: Remove this true when async is done
-        Ok(true)
+    async fn check_write_page_data(&mut self) -> Result<(), ()> {
+        // Is bootloading active?
+        // TODO: This duplicates the get_page_mut check
+        // TODO: How can I make this check at compile time?
+        if !self.map.unlocked {
+            sprkt_log!(error, "Bootloading not started!");
+            return Err(());
+        }
+
+        // * 1: Page/Subpage
+        //     * 0bPPPPP_SSS (32 pages, 8 sub-pages)
+        //     * 0bPPPPP must be <= 23
+        // * 256: subpage contents
+        // * 4 byte: For now: 32-bit checksum. Later, CRC32 or Poly1305?
+        let ps = self.i2c.get_written_byte().await;
+
+        let page = (ps >> 3) as usize;
+        let subpage = ps & 0b111;
+
+        assert!(page < TOTAL_PAGES);
+        assert!((subpage as usize) < SUBPAGES_PER_PAGE);
+
+        let msg = &mut self.buffer[..256];
+        for byte in msg.iter_mut() {
+            *byte = self.i2c.get_written_byte().await;
+        }
+
+        let mut checksum_unchecked_bytes = [0u8; 4];
+        for byte in checksum_unchecked_bytes.iter_mut() {
+            *byte = self.i2c.get_written_byte().await;
+        }
+        let checksum_unchecked = u32::from_le_bytes(checksum_unchecked_bytes);
+
+        let calc_checksum = generate_checksum(msg, None).ok_or(())?;
+
+        if calc_checksum != checksum_unchecked {
+            sprkt_log!(error, "Checksum mismatch!");
+            return Err(());
+        }
+
+        if page == 0 && subpage == 0 {
+            extern "C" {
+                static PreResetTrampoline: u32;
+                static _stack_start: u32;
+            }
+
+            if !self.map.ready_to_write_vector_subpage() {
+                sprkt_log!(error, "Must write page 0 subpage 0 last!");
+                return Err(());
+            }
+
+            let reset_vector = unsafe { &PreResetTrampoline as *const _ as usize };
+            let msp = unsafe { &_stack_start as *const _ as usize };
+
+            sprkt_log!(info, "Patching reset vector to the bootloader's: {=usize:X}", reset_vector);
+            sprkt_log!(info, "Patching MSP to the bootloader's: {=usize:X}", msp);
+
+            let mut reset_vector_bytes = [0u8; 4];
+            let mut msp_bytes = [0u8; 4];
+
+            msp_bytes.copy_from_slice(&msg[..4]);
+            reset_vector_bytes.copy_from_slice(&msg[4..8]);
+
+            self.map.reset_vector = usize::from_le_bytes(reset_vector_bytes);
+            self.map.msp = usize::from_le_bytes(msp_bytes);
+
+            msg[..4].copy_from_slice(&msp.to_le_bytes());
+            msg[4..8].copy_from_slice(&reset_vector.to_le_bytes());
+        }
+
+        let map = self.map.get_page_mut(page).ok_or(())?;
+
+        if *map == 0 {
+            sprkt_log!(info, "Subpage accepted. Erase + Flash started");
+            // All subpages have never been written, time to erase page
+            *map = *map | (1 << subpage);
+
+            self.i2c.wait_for_stop().await;
+
+            let _ = self.disable_i2c()?;
+            self.erase_page(page).await?;
+            self.write_subpage(page, subpage).await?;
+            let _ = self.enable_i2c()?;
+
+            Ok(())
+        } else if (*map & 1 << subpage) == 0 {
+            sprkt_log!(info, "Subpage accepted. Flash started");
+            *map = *map | (1 << subpage);
+
+            self.i2c.wait_for_stop().await;
+
+            let _ = self.disable_i2c()?;
+            self.write_subpage(page, subpage).await?;
+            let _ = self.enable_i2c()?;
+
+            Ok(())
+        } else {
+            sprkt_log!(error, "Can't re-write pages!");
+            Err(())
+        }
+    }
+
+
+    async fn activate_bootload(&mut self) -> Result<(), ()> {
+        let mut checksum_bytes = [0u8; 4];
+        for byte in checksum_bytes.iter_mut() {
+            *byte = self.i2c.get_written_byte().await;
+        }
+
+        // TODO: Use global checksum!
+        let _checksum = u32::from_le_bytes(checksum_bytes);
+        let subpages = self.i2c.get_written_byte().await;
+
+        if subpages as usize > TOTAL_SUBPAGES {
+            sprkt_log!(error, "Too many subpages!");
+            return Err(());
+        }
+
+        if subpages % (SUBPAGES_PER_PAGE as u8) != 0 {
+            sprkt_log!(error, "Must provide whole page!");
+            return Err(());
+        }
+
+        let pages = (subpages >> 3) as usize;
+
+        if self.map.unlocked {
+            sprkt_log!(warn, "Already unlocked, resetting programming!");
+        }
+
+        self.map.pages.iter_mut().for_each(|b| {
+            *b = 0;
+        });
+
+        self.map.unlocked = true;
+        self.map.active_pages = pages;
+
+        sprkt_log!(info, "Unlocked Bootloading; pages: {=u8}, checksum: {=u32:X}", subpages, _checksum);
+
+        self.i2c.wait_for_stop().await;
+
+        Ok(())
     }
 
     fn write_settings_page(&mut self) -> Result<bool, ()> {
@@ -197,14 +405,6 @@ impl<P: Instance> BootMachine<P> {
     fn set_i2c_addr(&mut self, addr: u8) {
         self.new_i2c_addr = Some(addr);
     }
-}
-
-
-impl<P: Instance> BootMachine<P> {
-    async fn async_match_write_register(&mut self) -> u8 {
-        self.i2c.get_written_byte().await
-    }
-
 
     async fn async_start_txfr(&mut self, addr: u8) -> Result<(), ()> {
         match addr {
@@ -216,7 +416,7 @@ impl<P: Instance> BootMachine<P> {
             //         * NOTE: must be less than 23 * 8 for now
             0x40 => {
                 sprkt_log!(info, "Start Bootload");
-                self.async_activate_bootload().await
+                self.activate_bootload().await
             }
 
             // * 0x41 - write page command
@@ -236,7 +436,7 @@ impl<P: Instance> BootMachine<P> {
             //         * 0:0 must be the last thing written
             0x41 => {
                 sprkt_log!(info, "Write Page");
-                self.async_check_write_page_data().await
+                self.check_write_page_data().await
             }
 
             //     * 0x42 - complete and reboot
@@ -299,212 +499,11 @@ impl<P: Instance> BootMachine<P> {
         }
     }
 
-    async fn async_check_write_page_data(&mut self) -> Result<(), ()> {
-        // Is bootloading active?
-        // TODO: This duplicates the get_page_mut check
-        // TODO: How can I make this check at compile time?
-        if !self.map.unlocked {
-            sprkt_log!(error, "Bootloading not started!");
-            return Err(());
-        }
-
-        // * 1: Page/Subpage
-        //     * 0bPPPPP_SSS (32 pages, 8 sub-pages)
-        //     * 0bPPPPP must be <= 23
-        // * 256: subpage contents
-        // * 4 byte: For now: 32-bit checksum. Later, CRC32 or Poly1305?
-        let ps = self.i2c.get_written_byte().await;
-
-        let page = (ps >> 3) as usize;
-        let subpage = ps & 0b111;
-
-        assert!(page < TOTAL_PAGES);
-        assert!((subpage as usize) < SUBPAGES_PER_PAGE);
-
-        let msg = &mut self.buffer[..256];
-        for byte in msg.iter_mut() {
-            *byte = self.i2c.get_written_byte().await;
-        }
-
-        let mut checksum_unchecked_bytes = [0u8; 4];
-        for byte in checksum_unchecked_bytes.iter_mut() {
-            *byte = self.i2c.get_written_byte().await;
-        }
-        let checksum_unchecked = u32::from_le_bytes(checksum_unchecked_bytes);
-
-        let calc_checksum = generate_checksum(msg, None).ok_or(())?;
-
-        if calc_checksum != checksum_unchecked {
-            sprkt_log!(error, "Checksum mismatch!");
-            return Err(());
-        }
-
-        if page == 0 && subpage == 0 {
-            extern "C" {
-                static PreResetTrampoline: u32;
-                static _stack_start: u32;
-            }
-
-            if !self.map.ready_to_write_vector_subpage() {
-                sprkt_log!(error, "Must write page 0 subpage 0 last!");
-                return Err(());
-            }
-
-            let reset_vector = unsafe { &PreResetTrampoline as *const _ as usize };
-            let msp = unsafe { &_stack_start as *const _ as usize };
-
-            sprkt_log!(info, "Patching reset vector to the bootloader's: {=usize:X}", reset_vector);
-            sprkt_log!(info, "Patching MSP to the bootloader's: {=usize:X}", msp);
-
-            let mut reset_vector_bytes = [0u8; 4];
-            let mut msp_bytes = [0u8; 4];
-
-            msp_bytes.copy_from_slice(&msg[..4]);
-            reset_vector_bytes.copy_from_slice(&msg[4..8]);
-
-            self.map.reset_vector = usize::from_le_bytes(reset_vector_bytes);
-            self.map.msp = usize::from_le_bytes(msp_bytes);
-
-            msg[..4].copy_from_slice(&msp.to_le_bytes());
-            msg[4..8].copy_from_slice(&reset_vector.to_le_bytes());
-        }
-
-        let map = self.map.get_page_mut(page).ok_or(())?;
-
-        if *map == 0 {
-            sprkt_log!(info, "Subpage accepted. Erase + Flash started");
-            // All subpages have never been written, time to erase page
-            *map = *map | (1 << subpage);
-
-            self.i2c.wait_for_stop().await;
-
-            let _ = self.disable_i2c()?;
-            self.async_erase_page(page).await?;
-            self.async_write_subpage(page, subpage).await?;
-            let _ = self.enable_i2c()?;
-
-            Ok(())
-        } else if (*map & 1 << subpage) == 0 {
-            sprkt_log!(info, "Subpage accepted. Flash started");
-            *map = *map | (1 << subpage);
-
-            self.i2c.wait_for_stop().await;
-
-            let _ = self.disable_i2c()?;
-            self.async_write_subpage(page, subpage).await?;
-            let _ = self.enable_i2c()?;
-
-            Ok(())
-        } else {
-            sprkt_log!(error, "Can't re-write pages!");
-            Err(())
-        }
-    }
-
-    async fn async_activate_bootload(&mut self) -> Result<(), ()> {
-        let mut checksum_bytes = [0u8; 4];
-        for byte in checksum_bytes.iter_mut() {
-            *byte = self.i2c.get_written_byte().await;
-        }
-
-        // TODO: Use global checksum!
-        let _checksum = u32::from_le_bytes(checksum_bytes);
-        let subpages = self.i2c.get_written_byte().await;
-
-        if subpages as usize > TOTAL_SUBPAGES {
-            sprkt_log!(error, "Too many subpages!");
-            return Err(());
-        }
-
-        if subpages % (SUBPAGES_PER_PAGE as u8) != 0 {
-            sprkt_log!(error, "Must provide whole page!");
-            return Err(());
-        }
-
-        let pages = (subpages >> 3) as usize;
-
-        if self.map.unlocked {
-            sprkt_log!(warn, "Already unlocked, resetting programming!");
-        }
-
-        self.map.pages.iter_mut().for_each(|b| {
-            *b = 0;
-        });
-
-        self.map.unlocked = true;
-        self.map.active_pages = pages;
-
-        sprkt_log!(info, "Unlocked Bootloading; pages: {=u8}, checksum: {=u32:X}", subpages, _checksum);
-
-        self.i2c.wait_for_stop().await;
-
-        Ok(())
-    }
-
-    async fn async_write_subpage(&mut self, page: usize, subpage: u8) -> Result<(), ()> {
-        let subpage_image = &self.buffer[..256];
-
-        if subpage_image.iter().all(|b| *b == 0xFF) {
-            sprkt_log!(info, "Page is all 0xFF, skipping write");
-            return Ok(());
-        }
-
-        extern "C" {
-            static _app_start: u32;
-        }
-
-        let app_start = unsafe { &_app_start as *const _ as usize };
-
-        // NOTE: app_start is already offset to the base of the temporary flash region
-        let store_addr =
-            (app_start + (page * flash::PAGE_SIZE as usize)) + (subpage as usize * 256);
-
-        sprkt_log!(info, "Writing subpage at {=u32:X}...", store_addr as u32);
-
-        if !SKIP_FLASH {
-            // TODO: This is totally blocking! But there's not much else to do here
-            // while we're waiting, since flash writes stall the bus entirely
-            self.flash.write(store_addr, subpage_image).map_err(|_| {
-                sprkt_log!(error, "Write failed!");
-            })?;
-        } else {
-            sprkt_log!(warn, "Skipped actual write! Pretend it's good.");
-            sprkt_log!(info, "page: {:?}", subpage_image);
-        }
-
-        Ok(())
-    }
-
-    async fn async_erase_page(&mut self, page: usize /* TODO? */) -> Result<(), ()> {
-        sprkt_log!(info, "erasing page {=usize}...", page);
-
-        if !SKIP_FLASH {
-            // TODO: This is totally blocking, but it's going to stall
-            // the bus anyway, so not much use in yielding
-            if let Err(e) = self.flash.erase_page(FlashPage(page)) {
-                sprkt_log!(error, "Erase failed:");
-
-                match e {
-                    FlashError::Busy => sprkt_log!(info, "busy."),
-                    FlashError::Illegal => sprkt_log!(info, "illegal."),
-                    FlashError::EccError => sprkt_log!(info, "ecc err."),
-                    FlashError::PageOutOfRange => sprkt_log!(info, "page oor."),
-                    FlashError::Failure => sprkt_log!(info, "failure."),
-                };
-
-                return Err(());
-            }
-        } else {
-            sprkt_log!(warn, "Skipped actual erase! Pretend it's good.");
-        }
-
-        Ok(())
-    }
 
     pub async fn entry(&mut self) -> Result<(), ()> {
         loop {
             self.i2c.match_address_write().await;
-            let addr = self.async_match_write_register().await;
+            let addr = self.match_write_register().await;
             self.async_start_txfr(addr).await?;
         }
     }
