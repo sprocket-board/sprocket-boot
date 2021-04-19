@@ -39,7 +39,7 @@ use stm32g0xx_hal::{
 };
 
 use cassette::{
-    CasMachine,
+    Cassette,
     pin_mut,
 };
 
@@ -337,7 +337,7 @@ fn inner_main() -> Result<(), ()> {
 
     pin_mut!(x);
 
-    let mut machine = CasMachine::new(x);
+    let mut machine = Cassette::new(x);
 
     loop {
         if let Some(_) = machine.poll_on() {

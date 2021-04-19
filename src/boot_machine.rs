@@ -33,7 +33,7 @@ use stm32g0xx_hal::{
 pub struct BootMachine<P: Instance> {
     i2c: I2CPeripheral<P>,
     current_i2c_addr: u8,
-    buffer: [u8; 512],
+    buffer: [u8; 256],
     flash: UnlockedFlash,
     map: PageMap,
     pub led1: PA0<Output<PushPull>>,
@@ -54,7 +54,7 @@ impl<P: Instance> BootMachine<P> {
         Self {
             i2c,
             flash,
-            buffer: [0u8; 512],
+            buffer: [0u8; 256],
             map: PageMap {
                 pages: [0; TOTAL_PAGES],
                 active_pages: 0,
@@ -246,10 +246,10 @@ impl<P: Instance> BootMachine<P> {
 
             self.i2c.wait_for_stop().await;
 
-            let _ = self.disable_i2c()?;
+            self.disable_i2c()?;
             self.erase_page(page).await?;
             self.write_subpage(page, subpage).await?;
-            let _ = self.enable_i2c()?;
+            self.enable_i2c()?;
 
             Ok(())
         } else if (*map & 1 << subpage) == 0 {
@@ -258,9 +258,9 @@ impl<P: Instance> BootMachine<P> {
 
             self.i2c.wait_for_stop().await;
 
-            let _ = self.disable_i2c()?;
+            self.disable_i2c()?;
             self.write_subpage(page, subpage).await?;
-            let _ = self.enable_i2c()?;
+            self.enable_i2c()?;
 
             Ok(())
         } else {
@@ -310,7 +310,7 @@ impl<P: Instance> BootMachine<P> {
         Ok(())
     }
 
-    fn write_settings_page(&mut self) -> Result<bool, ()> {
+    fn write_settings_page(&mut self) -> Result<(), ()> {
         extern "C" {
             static _settings_start: u32;
         }
@@ -376,10 +376,10 @@ impl<P: Instance> BootMachine<P> {
             sprkt_log!(warn, "Skipped actual settings write! Pretend it's good.");
         }
 
-        Ok(true)
+        Ok(())
     }
 
-    fn reboot(&mut self) -> Result<bool, ()> {
+    fn reboot(&mut self) -> ! {
         if !SKIP_FLASH {
             // TODO: Re-lock flash?
             // TODO: Clear RAM flags?
@@ -450,12 +450,10 @@ impl<P: Instance> BootMachine<P> {
                 } else {
                     self.i2c.wait_for_stop().await;
                     let _ = self.disable_i2c()?;
-                    let _ = self.write_settings_page()?;
+                    self.write_settings_page()?;
 
                     // See you later, space cowboy.
-                    loop {
-                        let _ = self.reboot();
-                    }
+                    self.reboot();
                 }
             }
             //     * 0x43 - abort bootload
