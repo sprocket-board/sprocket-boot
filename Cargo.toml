@@ -16,6 +16,11 @@ members = [
 cortex-m-rt = "0.6.13"
 embedded-hal = "0.2.4"
 
+[dependencies.cassette]
+version = "0.2.1"
+git = "https://github.com/jamesmunns/cassette"
+branch = "main"
+
 [dependencies.panic-reset]
 version = "0.1"
 optional = true
